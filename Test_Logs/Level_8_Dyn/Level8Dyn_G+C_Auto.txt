@@ -1,0 +1,341 @@
+================================================================================
+REVERSE ENGINEERING LOG: RANSOMWARE / CHALLENGE BINARY — PASSWORD RECOVERY
+================================================================================
+Date of analysis session: 2026-04-08 (per user environment)
+Output path: /home/kali/Documents/MCPTesting/Test_Logs/ghidra_cutter_ransomware_password_solve_log.txt
+
+Purpose of this document
+------------------------
+This file records every investigative step taken to locate and recover the
+“shutdown” / unlock password for a Linux ELF loaded concurrently in Ghidra and
+Cutter. It includes raw data observed from MCP-connected tools, how each piece
+was interpreted, and why those interpretations led to the final answer.
+
+================================================================================
+STEP 1 — STRING AND SYMBOL RECONNAISSANCE (GHIDRA MCP)
+================================================================================
+
+Actions
+-------
+• Invoked Ghidra MCP: list_strings with filters: "password", "pass", "shutdown", "kill"
+• Invoked Ghidra MCP: search_functions_by_name with query "password"
+• (Parallel) Intended Cutter MCP function search; Cutter returned empty for that query
+
+Data read (exact / summarized)
+-------------------------------
+From list_strings:
+  Address 0x0010305c: "Usage: %s <password>\n"
+
+From list_strings with filter "pass" (same hit as above).
+
+From list_strings with filters "shutdown" and "kill": no program strings matched.
+
+From list_functions / search_functions_by_name: no symbol name containing "password".
+
+From list_strings (broader listing, offset 0, limit 500) — notable .rodata entries:
+  0x00103004: "expand 8-byte k"
+  0x00103014: "/proc"
+  0x0010301a: "/proc/%s/comm"
+  0x0010302a: "You achieved Level 8!"
+  0x00103040: "Sorry, not quite there yet."
+  0x0010305c: "Usage: %s <password>\n"
+
+Interpretation
+-------------
+• The binary is CLI-driven: it expects a password as an argument (usage string).
+• Success and failure are explicit user-facing messages, not silent exit codes alone.
+• "expand 8-byte k" strongly suggests a key-schedule string seen in classic
+  ciphers (RC2 family uses similar expansion phrasing); flagged as likely
+  cryptographic material, not the password itself.
+• "/proc" and "/proc/%s/comm" suggest process enumeration (anti-analysis or
+  self-defense behavior); noted for later but not needed for static password
+  extraction.
+
+Why this step
+-------------
+Strings are the fastest way to find CLI usage, success/failure text, and hints
+about crypto or behavior without reading all of .text.
+
+================================================================================
+STEP 2 — CROSS-REFERENCES TO THE USAGE STRING (GHIDRA MCP)
+================================================================================
+
+Action
+------
+• get_xrefs_to address 0x0010305c
+
+Data read
+---------
+References from within FUN_001021b8:
+  • From 0x00102212 in FUN_001021b8 [DATA]
+  • From 0x0010221c in FUN_001021b8 [PARAM]
+
+Interpretation
+--------------
+The printf-style usage line is only referenced from one function, so that
+function is almost certainly the program entry logic (argc/argv handling).
+
+Why
+---
+Following xrefs from a unique string anchors the decompiler on the real “main”
+equivalent even when stripped symbols hide the name.
+
+================================================================================
+STEP 3 — DECOMPILE THE CLI / “MAIN” FUNCTION (GHIDRA + CUTTER)
+================================================================================
+
+Actions
+-------
+• Ghidra: decompile_function_by_address 0x001021b8
+• Cutter: decompile_function_by_address 0x001021b8 (corroboration)
+
+Data read — Ghidra pseudocode (semantics)
+-----------------------------------------
+FUN_001021b8(int param_1, undefined8 *param_2):
+  if (param_1 == 2):
+    local_c = FUN_00101f7c(param_2[1])
+    if (local_c == 1): puts("You achieved Level 8!")
+    else: puts("Sorry, not quite there yet.")
+  else:
+    printf("Usage: %s <password>\n", *param_2)
+
+Interpretation
+--------------
+• param_1 is argc; must be 2 for one password argument.
+• param_2 is argv; argv[1] is passed to FUN_00101f7c.
+• FUN_00101f7c returns 1 on success (truthy), else failure messages.
+
+Why
+---
+This maps user input to the exact check routine address for deeper analysis.
+
+================================================================================
+STEP 4 — DECOMPILE THE PASSWORD CHECK (FUN_00101f7c)
+================================================================================
+
+Action
+------
+• Ghidra: decompile_function_by_address 0x00101f7c
+
+Data read — key behavioral elements (summarized from decompilation)
+--------------------------------------------------------------------
+• signal(5, FUN_00101249); raise(5);
+• clock_gettime(1, &start_time)
+• A 53-byte (0x35) byte array is filled with constants on the stack (target for memcmp).
+• User input is copied into a 53-byte stack buffer (structured as qword chunks in the decompiler).
+• FUN_0010154d(&user_buffer, 0x35, 0x9988776655443322) mutates the user buffer in place.
+• clock_gettime again; elapsed time must be ≤ 500 ms or check fails.
+• memcmp(transformed_user, expected_53_bytes, 0x35) must be zero for success.
+• Prior gates: FUN_00101f28 and FUN_001016f2 must both return 0 (anti-debug / environment).
+
+Numeric / structural data explicitly important
+-----------------------------------------------
+• Transform call: FUN_0010154d(..., length=0x35, third argument=0x9988776655443322).
+• Compare length: 0x35 = 53 bytes.
+
+Interpretation
+--------------
+• The password is NOT compared in plaintext; it is passed through FUN_0010154d
+  (stream-like XOR after a keystream generator) and compared to an embedded
+  53-byte constant.
+• Runtime constraints (signal, ptrace-style checks, 500 ms) explain why running
+  under a debugger or slowly might fail even with the correct password.
+• The 64-bit constant 0x9988776655443322 is a fixed “seed” or key material
+  for keystream generation (endian-extracted into bytes in the next function).
+
+Why
+---
+memcmp after an in-place transform tells us the recovery problem: invert or
+reimplement the transform to XOR ciphertext (expected blob) with the same
+keystream to recover the passphrase.
+
+================================================================================
+STEP 5 — DECOMPILE FUN_0010154d (STREAM APPLICATION)
+================================================================================
+
+Action
+------
+• Ghidra: decompile_function_by_address 0x0010154d
+
+Data read — algorithm structure
+-------------------------------
+• Zeros a 64-byte stack region (conceptually), then writes:
+  - Bytes extracted from third parameter (8 bytes, one per loop iteration using shifts).
+  - Interleaved with dwords from the string at 0x00103004 ("expand 8-byte k" / 16 bytes as 4 dwords).
+• Outer loop over data length in steps of 0x40 (64), with a block counter written
+  into the key state (later verified via disassembly at RBP-0x40 / -0x3c).
+• Inner: FUN_0010125d(keystream_out, key_state); then for each byte in the current
+  chunk: buffer[i] ^= keystream[i].
+• If a global (DAT_001050a0) is non-zero, the function memsets the user buffer to
+  zero (anti-debug / tamper path).
+
+Interpretation
+--------------
+• This is “generate 64 bytes of keystream from a 64-byte expanded key state,
+  XOR into plaintext/ciphertext buffer, advance block counter.”
+• Because XOR is symmetric, if C = P XOR KS, then P = C XOR KS when KS matches.
+• The expected memcmp blob is the post-transform value; XORing it with the
+  same keystream bytes yields the original password bytes.
+
+Why
+---
+Establishes exact operations needed for offline recovery without running the
+possibly hostile binary.
+
+================================================================================
+STEP 6 — DISASSEMBLE FUN_0010154d FOR EXACT MEMORY LAYOUT (GHIDRA MCP)
+================================================================================
+
+Action
+------
+• Ghidra: disassemble_function address 0x0010154d
+
+Data read — machine-level facts used later
+------------------------------------------
+• PXOR + MOVAPS clear 64 bytes at RBP-0x60 .. (four xmmword stores).
+• LEA to 0x00103004 loads the “expand 8-byte k” string address.
+• SAR on RDX with (7-c)*8 extracts bytes of the third argument into a temporary,
+  stored at RBP-0x20 downward — i.e. MSB-to-LSB order into memory for the first
+  qword layout used as two little-endian dwords.
+• Sequenced MOVs place dwords into the 64-byte key block at RBP-0x60:
+  pattern: magic dword, key dword0, key dword1, magic dword, magic dword,
+           key dword0, key dword1, magic dword (8 dwords = 32 bytes).
+• Each outer iteration:
+  MOV qword at RBP-0x10 (block index) into dwords at RBP-0x40 and RBP-0x3c.
+• CALL 0x0010125d with RDI = keystream buffer (RBP-0xa0), RSI = key block (RBP-0x60).
+
+Interpretation
+--------------
+• First 32 bytes of the 64-byte key state are fixed from string + key constant;
+  next 8 bytes are the 64-bit block counter (low 32 at -0x40, high 32 at -0x3c);
+  remaining bytes stay zero from the initial clear — total 64 bytes fed to the mixer.
+• For a 53-byte password only block index 0 is needed (53 < 64).
+
+Why
+---
+Decompilers sometimes blur stack layout; disassembly confirmed counter placement
+and zero-filled tail, preventing wrong keystream from off-by-something layout bugs.
+
+================================================================================
+STEP 7 — FUN_0010125d: GHIDRA DECOMPILE VS. DISASSEMBLY
+================================================================================
+
+Action
+------
+• Ghidra decompile_function_by_address 0x0010125d showed multiply/shift mixing.
+• Ghidra disassemble_function 0x00100125d / 0x0010125d revealed ROL/ROR/XOR ops.
+
+Data read — ground truth from disassembly (conceptual)
+--------------------------------------------------------
+• memcpy local 64 bytes from input key state to working state at RBP-0x50.
+• Loop variable at [RBP-0x4]: compare to 9, JLE → 10 total rounds (0..9).
+• Each round is a long sequence of 32-bit operations using ROL imm8 and ROR imm8.
+• After rounds, for i = 0..15:
+  output_dword[i] = input_dword[i] + mixed_dword[i] (ADD, store to first arg buffer).
+
+Interpretation
+--------------
+• Ghidra’s high-level pseudocode for this function was misleading (wrong model).
+• Cutter/Ghidra disassembly is authoritative: custom ARX (add-rotate-xor) mixer.
+• Final keystream words are (original_key_state_word + mixed_state_word) mod 2^32,
+  serialized little-endian to 64 bytes.
+
+Why
+---
+Trusting the wrong pseudocode led to garbage plaintext; switching to disassembly
+was necessary for correctness.
+
+================================================================================
+STEP 8 — TRANSCRIBING ONE FULL MIX ROUND (16×uint32 STATE)
+================================================================================
+
+Method
+------
+• Mapped stack slots RBP-0x50 .. RBP-0x14 to indices v[0]..v[15] (each slot 4 bytes).
+• Transcribed each instruction group in order as it appears in the disassembly dump,
+  applying updates sequentially (later instructions see updated registers / stack).
+
+Pitfall encountered and fix
+----------------------------
+• The fourth quaternion in the round (starting ~0x00101375) mixes v[3], v[7], v[11],
+  v[15] in an order that differs from the “(0,4,8,12) style” blocks.
+• An initial transcription mistakenly used v[15]^=f(v[3],v[7]) style ordering;
+  aligning with the actual operands (v[3]^=rol(v[11]+v[15],7), etc.) made the
+  recovered plaintext ASCII.
+
+Why order matters
+-----------------
+Each step reads the current memory; wrong order produces a different permutation
+and wrong keystream.
+
+================================================================================
+STEP 9 — OFFLINE RECOVERY SCRIPT (PYTHON)
+================================================================================
+
+Inputs encoded from analysis
+----------------------------
+• Third-parameter key: 0x9988776655443322 → eight bytes via SAR-style extraction
+  (high to low byte order in the temporary) → little-endian dword pair (k0, k1).
+• Magic: sixteen bytes from "expand 8-byte k\0" interpreted as four little-endian dwords.
+• 64-byte key state construction:
+  words 0..7 from disassembly layout; qword at byte offset 32 = block index (0);
+  bytes 40..63 = zero.
+• Keystream: for block 0, compute mixed = 10 * mix_one_round on v initialized from
+  the 16 input dwords; output dword i = (inp[i] + mixed[i]) & 0xffffffff; flatten LE.
+• Plaintext byte i = ciphertext_byte i XOR keystream_byte i (for i in 0..52).
+
+Ciphertext constant (53 bytes) taken from Ghidra stack init in FUN_00101f7c
+(hex, in stack order local_88 descending through local_54 as decompiler showed):
+
+  c2 d4 e1 49 bd 6f b4 61 93 3f 77 26 b1 ff 4f e1
+  9f 50 03 43 8a c8 65 95 71 1f 9e a5 ab 4e a4 23
+  45 08 61 11 64 c8 ff 41 66 bb fa 40 2c 56 b8 ce
+  61 be 96 0d 35
+
+Note: decompiler displayed some bytes as decimal (e.g. 200 = 0xC8, 100 = 0x64);
+those were normalized to hex when building the byte array.
+
+Result
+------
+Recoverable ASCII (the password / flag):
+
+  flag_{Lin8_C@n_y0u_M4k3_a_b1n@ry_Pr!nt_!t$_0wn_Fl4g?}
+
+Interpretation
+--------------
+• This is the preimage under FUN_0010154d of the embedded 53-byte constant.
+• It is what argv[1] must equal for memcmp success, modulo anti-debug/timing.
+
+================================================================================
+STEP 10 — HOW CUTTER WAS USED VS. GHIDRA (CONSISTENCY NOTE)
+================================================================================
+
+• Ghidra MCP provided: strings, xrefs, decompilation of call graph, disassembly,
+  and exact rodata addresses.
+• Cutter MCP was invoked for parallel decompilation at key addresses; when Cutter
+  responses were empty in-session, Ghidra disassembly still supplied the needed
+  instruction-level truth for FUN_0010125d.
+• Practical takeaway: use Ghidra for structure and cross-references; validate
+  crypto primitives against disassembly when pseudocode looks like a generic cipher.
+
+================================================================================
+SUMMARY TABLE — RAW DATA → MEANING
+================================================================================
+
+Data observed                         | Interpretation
+--------------------------------------|---------------------------------------------
+"Usage: %s <password>\n" @0x10305c    | argv[1] is the password slot
+FUN_001021b8                          | argc==2 gate; calls validator
+"You achieved Level 8!"               | success path string
+FUN_00101f7c                          | signal/raise/time + transform + memcmp
+0x9988776655443322                    | fixed key material for keystream
+"expand 8-byte k" @0x103004           | part of 64-byte expanded state
+memcmp len 0x35                       | password length 53 bytes
+FUN_0010154d                          | XOR keystream into buffer, block counter
+FUN_0010125d disassembly (ROL/ROR)    | real mixer; Ghidra decompile unreliable
+53-byte stack constant                | transformed password digest (target)
+XOR with recovered KS                 | yields ASCII password string
+
+================================================================================
+FILE END
+================================================================================

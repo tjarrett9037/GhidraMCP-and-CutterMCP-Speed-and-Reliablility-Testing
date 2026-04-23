@@ -1,0 +1,157 @@
+Ransomware Password Investigation Log
+Date: 2026-03-24
+Analyst: Cursor AI assistant via Ghidra MCP
+Objective: Identify a hardcoded password that can shut down / pass a control check in the loaded malware sample.
+
+======================================================================
+1) STEP-BY-STEP ACTION LOG (CHRONOLOGICAL)
+======================================================================
+
+Step 1 - Established investigation approach
+- Action:
+  - Decided to prioritize static reverse engineering via Ghidra MCP.
+  - Targeted likely password locations:
+    1) Embedded strings
+    2) Exported / named functions with semantic hints
+    3) Program control flow around argument parsing and password checks
+- Why:
+  - Password-based kill switches are often visible in cleartext strings, or in comparators inside helper functions with names like "check_password", "validate", "auth", etc.
+
+Step 2 - Enumerated strings, imports, exports in parallel
+- Tool calls:
+  - user-ghidra-list_strings(limit=2000)
+  - user-ghidra-list_imports(limit=200)
+  - user-ghidra-list_exports(limit=200)
+- Why:
+  - This rapidly surfaces obvious clues (usage strings, success/failure messages, suspicious token formats, and function names).
+
+Step 3 - Interpreted string output
+- Observed key string lines:
+  - 0047700e: "@@You achieved Level 2!"
+  - 00477026: "Sorry, not quite there yet."
+  - 00477042: "Usage: %s <password>\n"
+- Interpretation:
+  - Strong indicator this binary takes a password CLI argument.
+  - "Level 2" success text strongly implies challenge-gated logic.
+  - The usage string confirms exactly one argument expected: "<password>".
+- Additional context:
+  - The string dump also included a very large amount of glibc/runtime text, which is common for statically linked or heavily bundled binaries and is mostly noise for password extraction.
+
+Step 4 - Interpreted exports/imports output
+- Export output included:
+  - check_password -> 00401725
+  - main -> 0040180a
+  - and many libc/runtime symbols
+- Import output:
+  - No useful standalone import list was returned in that call.
+- Interpretation:
+  - "check_password" is a direct high-confidence target.
+  - "main" is needed to confirm how arguments route into check_password and what success/failure paths look like.
+
+Step 5 - Decompiled high-value functions
+- Tool calls:
+  - user-ghidra-decompile_function(name="check_password")
+  - user-ghidra-decompile_function(name="main")
+- Why:
+  - This is the shortest path to ground truth for expected password value and verification logic.
+
+Step 6 - Extracted password from check_password decompilation
+- Raw decompile result:
+
+  bool check_password(char *param_1)
+
+  {
+    int iVar1;
+    char local_38 [48];
+
+    builtin_strncpy(local_38,"flag_{Lin2_WhY_1S_th!$_sTr1n9_h@rD3r_T0_fiNd?}",0x2f);
+    iVar1 = strcmp(param_1,local_38);
+    return iVar1 == 0;
+  }
+
+- Interpretation:
+  - The candidate password is explicitly hardcoded as:
+    flag_{Lin2_WhY_1S_th!$_sTr1n9_h@rD3r_T0_fiNd?}
+  - strcmp() exact-match semantics mean the password must match byte-for-byte.
+  - Return value true only when strcmp returns 0.
+
+Step 7 - Verified call flow in main
+- Raw decompile result:
+
+  undefined4 main(int param_1,undefined8 *param_2)
+
+  {
+    int iVar1;
+    undefined4 local_c;
+
+    if (param_1 == 2) {
+      iVar1 = check_password(param_2[1]);
+      if (iVar1 == 0) {
+        puts("Sorry, not quite there yet.");
+      }
+      else {
+        puts("You achieved Level 2!");
+      }
+    }
+    else {
+      printf("Usage: %s <password>\n",*param_2);
+    }
+    return local_c;
+  }
+
+- Interpretation:
+  - Requires exactly one argument besides program name (argc == 2).
+  - Passes argv[1] to check_password.
+  - On mismatch prints "Sorry, not quite there yet."
+  - On match prints "You achieved Level 2!"
+  - This confirms the extracted string is the exact success-triggering password.
+
+Step 8 - Reported final answer
+- Delivered identified password to user:
+  flag_{Lin2_WhY_1S_th!$_sTr1n9_h@rD3r_T0_fiNd?}
+- Also provided expected runtime behavior when run with the correct argument.
+
+======================================================================
+2) ALL DATA READ (AS USED IN THE ANALYSIS)
+======================================================================
+
+A) Strings listing (limit 2000) - high-signal excerpts used
+- 0047700e: "@@You achieved Level 2!"
+- 00477026: "Sorry, not quite there yet."
+- 00477042: "Usage: %s <password>\n"
+- The rest of the output contained a very large number of glibc/runtime and symbol strings; these were reviewed as context/noise and not used as primary evidence for the password value.
+
+B) Exports listing - key entries used
+- check_password -> 00401725
+- main -> 0040180a
+- (Many additional libc and runtime export symbols were present and not required for this specific extraction task.)
+
+C) Imports listing
+- The imports call in this session returned no useful output for this question.
+
+D) Decompilation output - primary evidence
+- check_password:
+  - Hardcoded literal copied into local buffer:
+    "flag_{Lin2_WhY_1S_th!$_sTr1n9_h@rD3r_T0_fiNd?}"
+  - Compared via strcmp(param_1, local_38)
+  - Returns true only on exact equality.
+- main:
+  - Expects argv-style password input
+  - Routes argv[1] into check_password
+  - Prints success/failure strings corresponding to comparator result.
+
+======================================================================
+3) WHY THIS CONCLUSION IS RELIABLE
+======================================================================
+
+- The password is not inferred heuristically; it is a direct hardcoded constant from the password-check function.
+- The control flow from main to check_password is explicit and straightforward.
+- The success/failure strings align exactly with comparator outcomes.
+- No dynamic unpacking or opaque predicate was required for this specific path.
+
+======================================================================
+4) FINAL IDENTIFIED PASSWORD
+======================================================================
+
+flag_{Lin2_WhY_1S_th!$_sTr1n9_h@rD3r_T0_fiNd?}
+

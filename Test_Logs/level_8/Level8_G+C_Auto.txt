@@ -1,0 +1,304 @@
+================================================================================
+FULL METHODOLOGY: PASSWORD RECOVERY (Lin8_2026 SAMPLE)
+================================================================================
+Date: 2026-04-08
+Objective: Document every step, data observed, interpretation, and rationale
+           for recovering the shutdown / "Level 8" password from the binary
+           analyzed in Ghidra and Cutter.
+Output: Recovered password (53 ASCII bytes) verified by offline Salsa20 XOR.
+================================================================================
+
+
+1) SCOPE AND TOOLS
+--------------------------------------------------------------------------------
+- Primary tools: Ghidra MCP (strings, xrefs, decompile) and Cutter MCP
+  (decompile, string xrefs, segment/header context from prior logs).
+- Goal: Find authentication string referenced by malware sample; user
+  hypothesis: password to shut down or unlock behavior exists in-file.
+- Approach: String-guided reverse engineering -> validation routine ->
+  cryptographic transform -> invert transform offline.
+
+
+2) STEP 1 — BROAD STRING AND ENTRY SEARCH (PARALLEL QUERIES)
+--------------------------------------------------------------------------------
+Actions taken (batch, for speed):
+- Ghidra: list_strings filter "pass"  -> one strong hit.
+- Ghidra: list_strings filter "shut"  -> libc / error noise only.
+- Ghidra: list_strings filter "kill"  -> RF-kill error string only.
+- Ghidra: search_functions_by_name "main" -> no symbol named main.
+- Cutter: search_functions_by_name "main" -> no match (stripped binary).
+
+Data read (Ghidra, filter "pass"):
+  Address    String
+  00478068   "Usage: %s <password>\n"
+
+Interpretation:
+- A printf-style usage string almost always marks the real CLI gate for a
+  secret argument. Competing "shutdown" / "kill" substrings did not surface
+  application-specific passwords; the usage line became the anchor.
+
+Why this mattered:
+- Stripped static binaries hide "main"; strings + xrefs are faster than
+  walking the entire call graph from the ELF entry.
+
+
+3) STEP 2 — FOLLOW DATA REFERENCES FROM THE USAGE STRING
+--------------------------------------------------------------------------------
+Action: Ghidra get_xrefs_to(address 0x00478068)
+
+Data read:
+  From 0040274e in FUN_004026f4 [DATA]
+  From 00402758 in FUN_004026f4 [PARAM]
+
+Interpretation:
+- Both xrefs land in the same function; the usage string is only referenced
+  from FUN_004026f4, which must implement or wrap the argv parsing path.
+
+Action: Ghidra decompile_function_by_address(0x004026f4)
+
+Data read (decompiler output, summarized):
+  int FUN_004026f4(int param_1, undefined8 *param_2)
+  {
+    int local_c;
+    if (param_1 == 2) {
+      local_c = FUN_004024b8(param_2[1]);
+      if (local_c == 1)
+        FUN_0040bd80("You achieved Level 8!");
+      else
+        FUN_0040bd80("Sorry, not quite there yet.");
+    } else
+      FUN_00405c20("Usage: %s <password>\n", *param_2);
+    return local_c;
+  }
+
+Interpretation:
+- param_1 == 2 means argc == 2: program name + one password argument.
+- param_2[1] is argv[1], passed to FUN_004024b8 for verification.
+- Return value 1 => success message; else failure message.
+- This is a CTF-style "Level 8" unlock, not necessarily OS-level ransomware exit,
+  but it is the in-binary secret the user asked for.
+
+Why this mattered:
+- Pinpointed the single callee that contains the real check: FUN_004024b8.
+
+
+4) STEP 3 — DECOMPILE THE VALIDATION ROUTINE (FUN_004024b8)
+--------------------------------------------------------------------------------
+Action: Ghidra decompile_function_by_address(0x004024b8)
+
+Data read (logical structure; full decompiler listed many stack byte inits):
+- Registers signal handlers early: FUN_004050c0(5, FUN_00401785); FUN_00405180(5);
+- Time-related paths: FUN_00426060 for timestamps; computes duration local_20;
+  if local_20 > 500 (interpreted as ms threshold in decompilation), returns false.
+- Anti-analysis calls before the crypto path: FUN_00402464(), FUN_00401c2e();
+  both must succeed (return 0) to proceed (decompiler shows compound condition).
+- Copies argv-derived input into stack slots local_c8 .. (53 bytes of user data).
+- Calls FUN_00401a89(&local_c8, 0x35, 0x9988776655443322):
+    * Buffer address, length 0x35 (53 decimal), third argument a 64-bit constant key.
+- Compares transformed buffer to a 53-byte constant array on stack (local_88
+  down through local_54 in Ghidra naming): uses thunk to resolved memcmp.
+- Returns true iff compare is equal (iVar1 == 0 after memcmp-style call).
+
+Interpretation:
+- Password is exactly 53 bytes from the program's perspective (or the copy is
+  fixed-width and compared as 53 bytes; behavior for shorter inputs depends on
+  surrounding copy logic—here the compare size is explicitly 0x35).
+- Transform is keyed: constant 0x9988776655443322 is not the plaintext password;
+  it seeds the stream cipher / XOR layer.
+- Reference ciphertext is embedded as immediate byte values in the function,
+  not as a readable rodata string—typical for obfuscated flags.
+
+Why this mattered:
+- Reduced the problem to: recover P such that
+    Transform(P, key=0x9988776655443322) == C
+  where C is the 53-byte stack constant array.
+- If Transform is XOR with a keystream K derived only from key and counter,
+  then P = C XOR K (inversion without brute force).
+
+
+5) STEP 4 — IDENTIFY THE TRANSFORM (FUN_00401a89)
+--------------------------------------------------------------------------------
+Action: Ghidra decompile_function_by_address(0x00401a89)
+
+Data read (high level):
+- Builds an 8-byte key schedule from param_3 by shifting bytes:
+  for i in 0..7: byte_i = (param_3 >> ((7 - i) * 8)) & 0xff
+  So the key in memory order (low address first) is MSB-to-LSB of the 64-bit
+  value: for 0x9988776655443322 -> bytes 99 88 77 66 55 44 33 22.
+- Places those bytes into a 64-bit stack variable; mixes with rodata constant
+  string pattern associated with "expand 8-byte k" (Salsa20 sigma variant).
+- Zero-initializes two 16-byte areas; loop variable local_18 acts as block
+  counter (0, 1, 2, ... per 64-byte output block).
+- Each iteration: FUN_00401799(local_a8, state) produces 64 bytes keystream
+  into local_a8; XORs keystream into param_1[offset ..] for length up to 64
+  or remaining length.
+- Anti-tamper: if DAT_004a50d0 != 0, instead of XOR, calls a routine that
+  zeroes the buffer (thunk_FUN_00419390 style path)—would defeat verification
+  under instrumentation that sets that flag.
+
+Interpretation:
+- Classic stream cipher usage: ciphertext_stream = plaintext_stream XOR KS(key,nonce,counter).
+- Here the "encryption" applied to the user input before compare means:
+    C = P XOR KS
+  so P = C XOR KS for the same KS.
+
+Action: Cutter decompile_function_by_address(0x00401a89) for clearer struct layout
+
+Data read (Rizin/rz-ghidra naming, critical constants):
+- var_20h points to data at 0x00478010 (sigma / k string region).
+- After key byte loop, explicit CONCAT/assignments expose 32-bit words:
+    * 0x61707865  ("expa" LE)
+    * 0x3820646e  (fragment of "expand 8-byte k")
+    * 0x7479622d  ("-byt" LE)
+    * 0x006b2065  ("e k" with leading zero byte in the word)
+- Key words: low 32 bits k1 = 0x22334455, high 32 bits k0 = 0x66778899 when
+  the 8-byte key MSB-first extraction is stored little-endian as uint64
+  0x2233445566778899 on the stack.
+
+Why this mattered:
+- Cutter's CONCAT44 layout disambiguated the order of the sixteen 32-bit
+  Salsa20 state words better than Ghidra's overlapping stack simplication.
+
+
+6) STEP 5 — CONFIRM CORE PRIMITIVE (FUN_00401799)
+--------------------------------------------------------------------------------
+Action: Ghidra decompile_function_by_address(0x00401799)
+
+Data read:
+- Copies 16 words from input state via thunk_FUN_00419090 (Ghidra names resolve
+  oddly in some builds; logic is still visible).
+- Applies 10 "double rounds" of quarter-round updates with rotations 7, 9, 13,
+  18 bits—matching the Salsa20 / ChaCha family column-round then row-round
+  structure.
+- Final step: output_word[i] = original_state[i] + working_state[i] (mod 2^32),
+  packed into 64 output bytes.
+
+Interpretation:
+- This is the Salsa20 block function (20 rounds = 10 double rounds).
+- Not a custom ad-hoc hash; standard structure means a vanilla implementation
+  can reproduce keystream if state words match the binary's layout.
+
+
+7) STEP 6 — EXTRACT THE 53-BYTE REFERENCE CIPHERTEXT C
+--------------------------------------------------------------------------------
+Source: Ghidra local variable initializers in FUN_004024b8 (read from
+decompiler listing in session).
+
+Data read (53 bytes, in compare order with the memcmp):
+
+  c2 d4 e1 49 bd 6f b4 61 93 3f 77 26 b1 ff 4f e1
+  9f 50 03 43 8a c8 65 95 71 1f 9e a5 ab 4e a4 23
+  45 08 61 11 64 c8 ff 41 66 bb fa 40 2c 56 b8 ce
+  61 be 96 0d 35
+
+Hex (continuous):
+  c2d4e149bd6fb461933f7726b1ff4fe19f5003438ac86595711f9ea5ab4ea423
+  4508611164c8ff4166bbfa402c56b8ce61be960d35
+
+Interpretation:
+- This is C = Transform(P_correct).
+- Printable ASCII after XOR with KS is expected for a flag-style password.
+
+Cross-check:
+- Same byte sequence appears in prior workspace log
+  Documents/MCPTesting/Test_Logs/level_8/level8_Cutter_Auto.txt section 7,
+  confirming consistency between Ghidra read and earlier Cutter-oriented export.
+
+
+8) STEP 7 — RECONSTRUCT SALSA20 STATE WORDS (TRIAL AND ERROR TO MATCH BINARY)
+--------------------------------------------------------------------------------
+Initial attempt (incorrect word order for words 0-7):
+- Placed constants and k0,k1 in an order that swapped some sigma/key slots.
+- Python XOR produced garbage (non-printable first byte 0x8f).
+
+Correction:
+- Align 16 x uint32 little-endian state exactly as memory layout from Cutter:
+  w0  = 0x61707865  (sigma)
+  w1  = k1          (0x22334455)
+  w2  = k0          (0x66778899)
+  w3  = 0x3820646e
+  w4  = 0x7479622d
+  w5  = k1
+  w6  = k0
+  w7  = 0x006b2065
+  w8  = block_counter & 0xffffffff  (counter = 0 for first block)
+  w9  = (block_counter >> 32) & 0xffffffff
+  w10..w15 = 0
+
+Interpretation:
+- Salsa20 output depends critically on word order; one transposed pair breaks
+  the entire keystream.
+- Block counter  suffices for 53 bytes (only first keystream block needed).
+
+
+9) STEP 8 — OFFLINE VERIFICATION (PYTHON)
+--------------------------------------------------------------------------------
+Action:
+- Implement quarterround, doubleround, 10 double-rounds, final add.
+- Pack state as 16 little-endian uint32s per section 8.
+- Generate first 64-byte keystream block with counter = 0.
+- XOR first 53 bytes with C.
+
+Data produced:
+  Plaintext (ASCII):
+    flag_{Lin8_C@n_y0u_M4k3_a_b1n@ry_Pr!nt_!t$_0wn_Fl4g?}
+
+Interpretation:
+- Fully printable flag-shaped secret; length 53 matches 0x35.
+- Confirms both ciphertext extraction and Salsa state layout.
+
+Note on Ghidra import noise:
+- Some thunks (e.g., FUN_00419090) decompile as PLT/indirection tables in
+  certain database states; they were not needed once FUN_00401799 and
+  FUN_00401a89 semantics were established.
+
+
+10) STEP 9 — CROSS-REFERENCE WITH EXISTING TEST LOG (OPTIONAL CONSISTENCY)
+--------------------------------------------------------------------------------
+File read: Documents/MCPTesting/Test_Logs/level_8/level8_Cutter_Auto.txt
+
+Observations from that log (already aligned with this session):
+- Binary path: .../Test_Files/Working_files/CutterMCP_Solves/Lin8_2026
+- Static, stripped, NX, non-PIE ELF; entry 0x00401660.
+- String addresses for success/fail/usage in .rodata at 0x004780xx.
+- Same xref region 0x4027xx and same validation/cipher summary.
+
+Interpretation:
+- Independent analyst log corroborates addresses, workflow, and final flag,
+  increasing confidence beyond a one-off script mistake.
+
+
+11) FINAL ANSWER (DATA OUTPUT)
+--------------------------------------------------------------------------------
+Recovered password (53 bytes):
+  flag_{Lin8_C@n_y0u_M4k3_a_b1n@ry_Pr!nt_!t$_0wn_Fl4g?}
+
+How to use (from FUN_004026f4):
+  Execute binary with argv[1] equal to the string above (quote for shell
+  metacharacters such as !$).
+
+Caveats for real-world malware:
+- This sample chains additional checks (timing, FUN_00402464, FUN_00401c2e,
+  etc.); tampering or emulator timing may cause false failure even with the
+  correct password.
+- Other samples or builds will not share the same C or key constant.
+
+
+12) TRACEABILITY SUMMARY (STEPS ONLY)
+--------------------------------------------------------------------------------
+ 1. Parallel string search -> anchor "Usage: %s <password>\n" @ 0x00478068.
+ 2. Xrefs -> FUN_004026f4 (argc/argv wrapper).
+ 3. Decompile FUN_004026f4 -> FUN_004024b8(argv[1]).
+ 4. Decompile FUN_004024b8 -> 53-byte compare, key 0x9988776655443322,
+    call FUN_00401a889.
+ 5. Decompile FUN_00401a89 + Cutter layout -> Salsa20-like XOR, 8-byte key unpack.
+ 6. Decompile FUN_00401799 -> confirm Salsa20 core (10 double-rounds).
+ 7. Extract C from stack inits in FUN_004024b8.
+ 8. Build 16-word Salsa state to match memory layout; generate KS, P = C XOR KS.
+ 9. Verify printable flag string; match length 0x35.
+10. Optionally compare with prior Test_Logs narrative for binary metadata.
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================

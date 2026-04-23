@@ -1,0 +1,450 @@
+Ransomware Password Recovery Log
+Date: 2026-03-31
+Analyst: Cursor coding agent (Ghidra MCP-assisted)
+
+Objective
+- Locate the "shutdown password" (command-line password gate) embedded in the loaded binary.
+
+Method Summary
+- Use Ghidra MCP to enumerate strings/functions/imports.
+- Identify password-check call path.
+- Reverse the input transformation used before comparison.
+- Reconstruct expected plaintext password.
+
+================================================================
+STEP-BY-STEP TRANSCRIPT WITH DATA, INTERPRETATION, AND REASONING
+================================================================
+
+Step 1) Enumerate high-signal artifacts in parallel
+Commands used:
+1. list_strings(limit=2000)
+2. search_functions_by_name("pass")
+3. search_functions_by_name("shutdown")
+4. list_imports(limit=200)
+
+Raw data read (important subset + notable full findings):
+- Strings returned included:
+  - "/proc"
+  - "/proc/%s/comm"
+  - "You achieved Level 9!"
+  - "Sorry, not quite there yet."
+  - "Usage: %s <password>\n"
+  - Plus dynamic symbols/section names.
+- search_functions_by_name("pass"): No functions matching 'pass'
+- search_functions_by_name("shutdown"): No functions matching 'shutdown'
+- Imports returned:
+  - ptrace, signal, raise, clock_gettime
+  - strcmp, fgets, fopen, readdir, opendir, closedir
+  - puts, printf, snprintf, strlen, memset, fclose
+
+Interpretation and why:
+- "Usage: %s <password>\n" strongly indicates a direct CLI password check path.
+- Success/failure strings suggest a binary challenge gate with boolean pass/fail logic.
+- Presence of ptrace/signal/raise/clock_gettime suggests anti-debugging/timing checks.
+- Presence of strcmp indicates likely direct buffer comparison against expected transformed data.
+
+
+Step 2) Pivot on strcmp references and discover execution path
+Commands used:
+1. get_function_xrefs("strcmp")
+2. list_functions()
+3. list_exports(limit=100)
+
+Raw data read:
+- strcmp xrefs:
+  - Multiple call sites from FUN_001015c2:
+    00101bdd, 00101c0f, 00101c41, 00101c73, 00101ca5, 00101cd7,
+    00101d09, 00101d3b, 00101d70, 00101da2
+- list_functions included:
+  - FUN_001015c2
+  - FUN_00101df8
+  - FUN_00101e4c
+  - FUN_00102075
+  - plus thunks/externals/init/fini entries
+- Exports included entry/init/fini functions.
+
+Interpretation and why:
+- A cluster of strcmp calls in one function (FUN_001015c2) usually means list-based matching (likely anti-analysis process checks).
+- Likely "main-like" function suspected as FUN_00102075 from function set and later decompilation.
+- Next move: decompile candidate orchestrator/verifier/helper functions.
+
+
+Step 3) Decompile first wave of key functions
+Commands used:
+1. decompile_function_by_address(0x001015c2)
+2. decompile_function_by_address(0x00102075)
+3. decompile_function_by_address(0x0010129e)
+
+Raw data read and interpretation:
+
+A) FUN_001015c2 (0x001015c2)
+- Reads /proc/*/comm and compares process names against:
+  - "gdb", "lldb", "radare2", "ida64", "cutter", "strace", "ltrace",
+    "valgrind", "binaryninja", and "edb"
+- Returns 1 if any match found, else 0.
+
+Why it matters:
+- Confirms anti-analysis process blacklist, not password logic directly.
+- Must be bypassed logically while reversing by understanding path conditions.
+
+B) FUN_00102075 (0x00102075)
+- If argc == 2:
+  - calls FUN_00101e4c(argv[1])
+  - prints "You achieved Level 9!" if return == 1, else failure string.
+- Else prints "Usage: %s <password>\n".
+
+Why it matters:
+- This is the CLI gate dispatcher (effectively main challenge function).
+- Password verifier is FUN_00101e4c.
+
+C) FUN_0010129e (0x0010129e)
+- 8 rounds of 16-bit operations with helper FUN_0010123d
+- Operates on 4x16-bit words.
+
+Why it matters:
+- Appears to generate a keystream-like block transform (used later by verifier).
+
+
+Step 4) Decompile second wave: verifier + transform + helpers
+Commands used:
+1. decompile_function_by_address(0x00101e4c)
+2. decompile_function_by_address(0x00101418)
+3. decompile_function_by_address(0x00101229)
+4. decompile_function_by_address(0x0010123d)
+
+Raw data read and interpretation:
+
+A) FUN_00101e4c (verifier)
+- Sets signal handler for signal 5 to FUN_00101229, then raise(5).
+- Captures start time with clock_gettime.
+- Defines a 0x34-byte constant byte array local_78:
+  41 9c 6d b9 8d c2 6f af a2 93 48 01 6d 68 9c 11
+  08 4c cc e4 ad 23 30 02 9f e6 92 dc af 83 fd bb
+  8b 7c 40 6a 08 be 04 14 ff cd 62 12 51 5b 58 8c
+  5b c2 bc e3
+- Requires:
+  - FUN_00101df8() == 0 (anti-ptrace)
+  - FUN_001015c2() == 0 (no analysis processes)
+  - elapsed time <= 500ms after signal/time checks
+- Copies 0x34 bytes from input password into local_b8.
+- Calls FUN_00101418(local_b8, 0x34, 0x123456789abcdef).
+- Compares transformed local_b8 byte-for-byte to local_78.
+- Returns 1 only if all 52 bytes match.
+
+Why it matters:
+- This is the exact password check algorithm.
+- local_78 is effectively encrypted/expected target.
+- Password length is exactly 52 bytes (0x34).
+
+B) FUN_00101418 (transform)
+- Builds 8 key bytes from 64-bit constant key 0x123456789abcdef.
+- Packs key into 4 x 16-bit words.
+- For each 8-byte chunk of input:
+  - Creates counter words from block index (64-bit counter split into 4 words).
+  - Calls FUN_0010129e(key_words, counter_words) to generate keystream words.
+  - XORs plaintext bytes with keystream bytes (word high byte for even index, low byte for odd index).
+- If global DAT_00105090 != 0, it zeroes output buffer instead.
+
+Why it matters:
+- This is symmetric XOR stream behavior: input XOR keystream = target.
+- So target XOR same keystream = original password.
+
+C) FUN_00101229
+- Sets DAT_00105090 = 0 in signal handler.
+
+Why it matters:
+- Works with raise/signal anti-debug state but does not alter password math.
+
+D) FUN_0010123d
+- 16-bit multiply-then-adjust primitive:
+  - u = a*b (32-bit)
+  - r = low16(u) - high16(u)
+  - if u > 0xffff, r -= 1
+  - return r (mod 16-bit)
+
+Why it matters:
+- Core nonlinear operation used in FUN_0010129e rounds.
+
+
+Step 5) Validate FUN_0010123d semantics at assembly level
+Command used:
+- disassemble_function(0x0010123d)
+
+Raw data read:
+- Assembly confirmed:
+  - IMUL EAX, EDX
+  - SHR EAX,0x10
+  - SUB EAX, ECX
+  - conditional SUB by 1 when product > 0xffff
+  - zero-extended 16-bit return
+
+Interpretation and why:
+- Confirmed exact unsigned 16-bit math needed to reproduce keystream correctly.
+- This removes ambiguity from decompiler signedness casts.
+
+
+Step 6) Verify anti-ptrace helper behavior
+Command used:
+- decompile_function_by_address(0x00101df8)
+
+Raw data read:
+- Calls ptrace(PTRACE_TRACEME,...)
+- If not -1 then ptrace(PTRACE_DETACH,...)
+- Returns (lVar1 == -1)
+
+Interpretation and why:
+- Verifier only continues when this returns 0; in hostile debug conditions it returns 1 and fails.
+- Not needed for offline decryption; relevant for runtime behavior understanding.
+
+
+Step 7) Re-implement algorithm externally and decode password (first attempt)
+Command used:
+- Python script in shell reproducing transform and XOR reversal.
+
+Raw result:
+- Produced mostly non-ASCII bytes:
+  - repr: 5\x9a\xa9\xc4p\x03F\x9c... (garbled)
+
+Interpretation and why:
+- Indicates state/word mapping mismatch in Python replication (likely variable ordering from decompiler artifacts).
+- Next step: correct internal word mapping based on exact update order from C pseudocode.
+
+
+Step 8) Correct state mapping and decode again (successful)
+Command used:
+- Second Python script with corrected variable mapping in round function.
+
+Raw result:
+- repr:
+  flag_{Lin9_Inl1n!ng_FuNc+10n5_i$_Ug1y_bUt_$0Lv4bL3.}
+- hasnull: False
+- len: 52
+
+Interpretation and why:
+- 52-byte printable token exactly matches expected verifier length (0x34).
+- Strongly confirms recovered input is the required password.
+
+
+Final recovered password
+- flag_{Lin9_Inl1n!ng_FuNc+10n5_i$_Ug1y_bUt_$0Lv4bL3.}
+
+
+Confidence assessment
+- High confidence.
+- Reasons:
+  1) Derived directly from embedded compare target and exact recovered transform.
+  2) Length and format align perfectly with verifier implementation.
+  3) Initial decode failure was resolved by correct round-state interpretation and produced coherent CTF-style flag text.
+
+
+Notes on interpretation choices
+- I treated FUN_00101418 as a keystream XOR transform because:
+  - It generates per-block bytes from a counter and key.
+  - It XORs those bytes with user input in place.
+  - Verifier compares transformed bytes to constant array.
+- Therefore, reversing is same operation: expected_bytes XOR keystream.
+
+End of log.
+Ransomware Password Recovery Log
+Date: 2026-03-31
+Analyst: Cursor agent session
+Environment: Ghidra MCP tools + local Python verification
+
+================================================================
+Objective
+================================================================
+Find the password that triggers the malware shutdown / success path,
+using static reverse engineering in Ghidra.
+
+Note:
+- The analyzed sample appears to be a small challenge-style ELF binary.
+- Despite this, the same reverse-engineering workflow applies: find
+  input-validation logic, reconstruct transform, recover required input.
+
+================================================================
+Step-by-step Procedure with Raw Data and Interpretation
+================================================================
+
+STEP 1) Initial string/symbol triage
+Why:
+- Quickly identify candidate user-facing messages and imported APIs that
+  reveal input-check behavior (e.g., memcmp/strcmp/crypto routines).
+
+Tool calls made:
+1. user-ghidra-list_strings(limit=2000)
+2. user-ghidra-list_imports(limit=200)
+3. user-ghidra-list_exports(limit=200)
+
+Raw data read (key items):
+From list_strings:
+- 00102004: "You achieved Level 5!"
+- 0010201a: "Sorry, not quite there yet."
+- 00102036: "Usage: %s <password>\n"
+- 001004d7: "memcmp"
+- Other standard ELF/libc strings and section names
+
+From list_imports:
+- __libc_start_main
+- puts
+- printf
+- memcmp
+- __cxa_finalize
+- _ITM_deregisterTMCloneTable
+- _ITM_registerTMCloneTable
+- __gmon_start__
+
+From list_exports:
+- entry at 00101070
+- _DT_INIT / __DT_INIT / _DT_FINI / __DT_FINI and startup helpers
+
+Interpretation:
+- Presence of "Usage: %s <password>" strongly indicates argv-based password check.
+- Presence of memcmp strongly suggests byte-level comparison against a
+  computed or hardcoded buffer.
+- "You achieved Level 5!" and failure text define success/failure branches.
+
+
+STEP 2) Locate check function and call graph anchors
+Why:
+- Identify where memcmp is called and find main-like routine handling argv.
+
+Tool calls made:
+1. user-ghidra-list_functions()
+2. user-ghidra-search_functions_by_name(query="main", limit=20)
+3. user-ghidra-get_function_xrefs(name="memcmp", limit=50)
+
+Raw data read:
+From list_functions (relevant subset):
+- FUN_00101159 at 00101159
+- FUN_0010143d at 0010143d
+- FUN_0010157a at 0010157a
+- entry at 00101070
+
+From search_functions_by_name("main"):
+- __libc_start_main @ 00105000
+
+From get_function_xrefs("memcmp"):
+- From 00101567 in FUN_0010143d [UNCONDITIONAL_CALL]
+
+Interpretation:
+- There is no user-named main symbol, but FUN_0010157a is likely logical
+  main wrapper (confirmed in next step).
+- memcmp call site in FUN_0010143d marks the core validator function.
+
+
+STEP 3) Decompile core validation and transform routine
+Why:
+- Recover exact algorithm: how user input is transformed and compared.
+
+Tool calls made:
+1. user-ghidra-decompile_function_by_address("0x0010143d")
+2. user-ghidra-decompile_function_by_address("0x00101159")
+3. user-ghidra-disassemble_function("0x0010143d")
+
+Raw data read:
+A) Decompile of FUN_0010143d:
+- Loads 47 hardcoded bytes into locals (starts with 0x5e, 0xde, 0xb9, ...,
+  ends ... 0xa4, 0x3d, 0xcd).
+- Copies user input bytes into local buffer.
+- Calls FUN_00101159(&local_input, 0x2f, 0x5f5d6e4c3b2a1d0e).
+- Calls memcmp(&transformed_input, &hardcoded_bytes, 0x2f).
+- Returns true if memcmp == 0.
+
+B) Decompile of FUN_00101159:
+- Initializes state array 0..255.
+- Performs key-scheduling-like loop with 8-byte key material.
+- Generates keystream bytes for param_2 length.
+- XORs keystream with input buffer in place.
+
+C) Disassembly of FUN_0010143d:
+- Confirms exact 47-byte target constants written byte-by-byte.
+- Confirms call arguments:
+  - length = 0x2f (47 bytes)
+  - key immediate = 0x5f5d6e4c3b2a1d0e
+  - memcmp length = 0x2f
+
+Interpretation:
+- Validation equation is:
+  transform(user_input, key) == target_bytes
+- Since transform is stream XOR, inverse is direct:
+  user_input = target_bytes XOR keystream(key)
+- This is RC4-style KSA/PRGA behavior.
+
+
+STEP 4) Confirm front-end argument handling (main-like function)
+Why:
+- Verify expected input source and control-flow messaging.
+
+Tool call made:
+1. user-ghidra-decompile_function_by_address("0x0010157a")
+
+Raw data read:
+- If argc == 2:
+  - local_c = FUN_0010143d(argv[1]);
+  - if true -> puts("You achieved Level 5!")
+  - else -> puts("Sorry, not quite there yet.")
+- Else:
+  - printf("Usage: %s <password>\n", argv[0])
+
+Interpretation:
+- Password is exactly argv[1].
+- Required length effectively 47 bytes due to compare length 0x2f.
+
+
+STEP 5) Reconstruct password by reversing transform
+Why:
+- Produce exact plaintext required to pass check.
+
+Method:
+- Wrote local Python snippet implementing same RC4-like logic:
+  - key bytes from 0x5f5d6e4c3b2a1d0e (little-endian as bytes in code path used)
+  - target byte array copied from decompilation/disassembly
+  - generate keystream length 47
+  - plaintext = target XOR keystream
+
+Command output read:
+- len 47
+- bytes b'flag_{Lin5_P4tch!ng_B1n@r!3$_iS_A_5up3r_P0w3r!}'
+- ascii flag_{Lin5_P4tch!ng_B1n@r!3$_iS_A_5up3r_P0w3r!}
+- repr 'flag_{Lin5_P4tch!ng_B1n@r!3$_iS_A_5up3r_P0w3r!}'
+- hex 666c61675f7b4c696e355f5034746368216e675f42316e40722133245f69535f415f35757033725f5030773372217d
+
+Interpretation:
+- Final recovered password is:
+  flag_{Lin5_P4tch!ng_B1n@r!3$_iS_A_5up3r_P0w3r!}
+
+================================================================
+Result
+================================================================
+Recovered password:
+flag_{Lin5_P4tch!ng_B1n@r!3$_iS_A_5up3r_P0w3r!}
+
+Confidence: High
+Rationale:
+- Derived directly from static control flow and exact comparison bytes.
+- Algorithm behavior confirmed by decompiled code and disassembly.
+- Inversion mathematically deterministic for stream-XOR transform.
+
+================================================================
+What data was read (consolidated inventory)
+================================================================
+1) Strings table (full top slice, 2000 cap) with notable literals:
+   - success/failure/usage messages, memcmp symbol, libc symbols.
+2) Import table:
+   - puts, printf, memcmp, __libc_start_main, etc.
+3) Export table:
+   - entry/init/fini symbols.
+4) Full function list:
+   - identified key routines FUN_00101159, FUN_0010143d, FUN_0010157a.
+5) Xrefs to memcmp:
+   - pinpointed validation call in FUN_0010143d.
+6) Decompiled pseudocode:
+   - FUN_0010143d (validator + target blob + memcmp).
+   - FUN_00101159 (RC4-like transform).
+   - FUN_0010157a (argc/argv and message flow).
+7) Disassembly of FUN_0010143d:
+   - exact byte constants and immediate key/length confirmation.
+8) Local Python verification output:
+   - recovered plaintext and encoding checks.
+
+End of log.

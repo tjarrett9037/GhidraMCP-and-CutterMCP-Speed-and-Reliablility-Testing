@@ -1,0 +1,223 @@
+Lin8_2026_dyn Reverse Engineering Log
+Date: 2026-04-08
+Analyst: Cursor coding agent (GPT-5.3-codex-low)
+Target binary: /home/kali/Documents/MCPTesting/Test_Files/Working_files/CutterMCP_Solves/Lin8_2026_dyn
+Goal: Identify shutdown password / kill-switch input accepted by the malware sample.
+
+====================================================================
+1) Initial Hypothesis and Tooling
+====================================================================
+- Environment had Cutter MCP access, so the workflow started with static function/import triage.
+- First hypothesis: a shutdown password would likely appear in one of:
+  - string comparisons (strcmp/memcmp),
+  - command-line argument checks,
+  - deobfuscation/crypto helpers,
+  - success/failure message branches in main.
+
+Why this approach:
+- Malware challenge binaries commonly gate kill-switch logic behind argument validation.
+- Fastest path is to locate compare APIs, then backtrack to data preparation.
+
+====================================================================
+2) Static Enumeration: Functions and Imports
+====================================================================
+Commands/tools used:
+- list_functions (0..200)
+- search_functions_by_name("pass")
+- search_functions_by_name("strcmp")
+- list_imports
+
+Data read:
+- Functions:
+  - 0x000016f2 fcn.000016f2
+  - 0x00001f28 fcn.00001f28
+  - 0x00001f7c fcn.00001f7c
+  - plus PLT imports and startup functions.
+- Relevant imports:
+  - strcmp, memcmp, fgets, strlen, snprintf, fopen, opendir/readdir, ptrace, signal, raise, puts, printf.
+
+Interpretation:
+- Presence of both strcmp and memcmp strongly indicates at least one string-based and one byte-buffer-based validation path.
+- ptrace + signal + raise suggests anti-debug/anti-analysis defenses.
+
+====================================================================
+3) strcmp Cross-References -> Process Blacklist Function
+====================================================================
+Command/tool:
+- xrefs_to(0x000010f0) [strcmp@plt]
+
+Data read:
+- All strcmp call sites point into fcn.000016f2.
+
+Then decompiled fcn.000016f2.
+
+Key decompile findings:
+- Opens /proc, iterates process entries, reads /proc/<pid>/comm.
+- Compares process names against hardcoded strings assembled on stack.
+- Strings reconstructed from immediate bytes include names such as:
+  - "gdb", "lldb", "radare2", "ida64", "cutter", "strace", "ltrace", "valgrind", "binaryninja", "edb".
+
+Interpretation:
+- This function is anti-analysis process detection, not the shutdown password itself.
+- Return value indicates whether a suspicious process is present.
+
+Why this mattered:
+- Eliminated a false lead and identified one prerequisite check that must be bypassed/neutralized for runtime extraction.
+
+====================================================================
+4) memcmp Cross-Reference -> Primary Validation Function
+====================================================================
+Commands/tools:
+- xrefs_to(0x000010d0) [memcmp@plt]
+- decompile_function_by_address(0x00001f7c)
+- disassemble_function(0x00001f7c)
+- show_function_detail(0x00001f7c)
+
+Data read (fcn.00001f7c):
+- Constructs a 0x35-byte constant target buffer on stack (hardcoded bytes).
+- Calls:
+  - fcn.00001f28()  -> ptrace-based anti-debug check.
+  - fcn.000016f2()  -> process blacklist anti-analysis check.
+- Performs a timing check; fails if elapsed > 500 ms.
+- Copies 0x35 bytes from argument buffer.
+- Calls fcn.0000154d(buffer, 0x35, 0x9988776655443322) to transform input.
+- Compares transformed bytes to hardcoded target via memcmp(..., 0x35).
+
+Interpretation:
+- This is the core password checker.
+- Required input length is 53 bytes (0x35).
+- Input is transformed (stream-cipher-like) before compare, so plaintext password is not present directly.
+
+====================================================================
+5) Locate main and Call Context
+====================================================================
+Commands/tools:
+- disassemble/decompile entry0 at 0x1160
+- objdump of binary to /home/kali/lin8_objdump.txt
+- rg/read sections around 0x21b8 (main)
+
+Data read:
+- entry0 passes 0x21b8 to __libc_start_main (so 0x21b8 is main).
+- At main:
+  - argc must equal 2.
+  - argv[1] passed directly to fcn.00001f7c.
+  - success/failure printed via puts.
+
+Interpretation:
+- The shutdown password is exactly the single command-line argument expected by main.
+- No extra decoding in main; all logic is in checker path.
+
+====================================================================
+6) Dynamic Extraction Attempt and Obstacles
+====================================================================
+Initial dynamic plan:
+- Break on memcmp.
+- Run binary with controlled 53-byte input ('A' * 53).
+- Dump compared buffers from rdi/rsi at memcmp.
+
+Observed obstacles:
+- Original binary path was "text file busy" when executed by gdb (file likely locked/open elsewhere).
+- Copied binary to /home/kali/Lin8_copy and debugged copy.
+- Program triggered SIGTRAP path due to anti-debug logic before reaching memcmp.
+- First anti-debug patch attempt over-wrote partial instructions and caused SIGSEGV.
+
+Interpretation:
+- Needed careful binary patching at instruction boundaries and minimal edits.
+
+====================================================================
+7) Controlled Patch Strategy on Local Copy (for analysis only)
+====================================================================
+Important note:
+- Patches were applied ONLY to /home/kali/Lin8_copy (analysis copy), not to the original sample.
+
+Patches applied:
+1) fcn.00001f28 at 0x1f28:
+   - Replaced prologue with: xor eax,eax ; ret
+   - Effect: anti-debug check always returns "not debugged".
+2) fcn.000016f2 at 0x16f2:
+   - Replaced prologue with: xor eax,eax ; ret
+   - Effect: process blacklist check always reports no analysis tools detected.
+3) fcn.00001f7c signal/raise block:
+   - NOP from 0x1f99 to 0x1fad (mov edi/call signal + mov edi/call raise sequence).
+   - Effect: removes forced SIGTRAP generation.
+4) fcn.0000154d branch at 0x1636:
+   - NOP two-byte JNE so code always takes cipher path instead of memset-zeroing branch.
+   - Reason: a runtime guard variable at 0x50a0 could force zeroization path; this ensured deterministic transform for extraction.
+
+Why this was required:
+- Without bypasses, debugger execution terminated before compare point.
+- Needed stable execution to capture both memcmp operands.
+
+====================================================================
+8) Runtime Data Capture at memcmp
+====================================================================
+Run parameters:
+- Program: /home/kali/Lin8_copy
+- Input: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" (53 bytes)
+- Breakpoint: memcmp
+- Memory dumps: x/53bx $rdi and x/53bx $rsi
+
+Data captured:
+- Transformed user input buffer (rdi), 53 bytes:
+  e5 f9 c1 6f a3 55 b9 49 bc 46 69 24 b0 d0 51 d9
+  ee 64 1d 4f ff e2 17 8b 51 01 bd d5 84 4f 97 1b
+  5b 19 52 71 4b fd e1 21 53 de e4 31 1a 79 a6 c9
+  4c cb b0 73 09
+
+- Target constant buffer (rsi), 53 bytes:
+  c2 d4 e1 49 bd 6f b4 61 93 3f 77 26 b1 ff 4f e1
+  9f 50 03 43 8a c8 65 95 71 1f 9e a5 ab 4e a4 23
+  45 08 61 11 64 c8 ff 41 66 bb fa 40 2c 56 b8 ce
+  61 be 96 0d 35
+
+Interpretation:
+- With test input all 0x41 bytes ('A'), the unknown transform stream can be derived as:
+  keystream = transformed_input XOR 0x41.
+- Required plaintext for successful compare:
+  password = target XOR keystream
+           = target XOR transformed_input XOR 0x41.
+
+====================================================================
+9) Password Recovery Computation
+====================================================================
+Computation performed in Python:
+- out[i] = rdi[i] ^ rsi[i] ^ 0x41 for i in 0..52
+
+Output produced:
+- Hex:
+  66 6c 61 67 5f 7b 4c 69 6e 38 5f 43 40 6e 5f 79
+  30 75 5f 4d 34 6b 33 5f 61 5f 62 31 6e 40 72 79
+  5f 50 72 21 6e 74 5f 21 74 24 5f 30 77 6e 5f 46
+  6c 34 67 3f 7d
+- ASCII:
+  flag_{Lin8_C@n_y0u_M4k3_a_b1n@ry_Pr!nt_!t$_0wn_Fl4g?}
+
+Interpretation:
+- Recovered 53-byte printable string matches expected challenge-style format.
+- This is the exact argument expected by checker after transformation.
+
+====================================================================
+10) Final Result
+====================================================================
+Recovered shutdown password:
+flag_{Lin8_C@n_y0u_M4k3_a_b1n@ry_Pr!nt_!t$_0wn_Fl4g?}
+
+Confidence:
+- High.
+- Derived from direct operand capture at final memcmp gate and deterministic byte-wise inversion.
+
+====================================================================
+11) Full Evidence Summary (Concise)
+====================================================================
+- Checker function: fcn.00001f7c
+- Arg flow: main(0x21b8) -> fcn.00001f7c(argv[1])
+- Compare primitive: memcmp(..., len=0x35)
+- Transform routine: fcn.0000154d(..., key=0x9988776655443322)
+- Anti-analysis functions:
+  - fcn.00001f28 (ptrace)
+  - fcn.000016f2 (/proc process-name blacklist)
+- Successful inversion formula from runtime operands:
+  plaintext = transformed_test_input XOR target XOR 0x41
+- Final plaintext recovered and validated as CTF-style flag string.
+
+End of log.

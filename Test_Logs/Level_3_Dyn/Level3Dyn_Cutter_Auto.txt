@@ -1,0 +1,177 @@
+Ransomware Password Recovery Log
+Date: 2026-04-07
+Environment: Cutter MCP tools + local Python decode check
+
+Objective
+- Identify a hardcoded "shutdown password" inside a ransomware sample loaded in Cutter.
+
+============================================================
+1) Initial reconnaissance of binary symbols and imports
+============================================================
+
+Action 1.1: Listed functions
+Tool: user-cutter-list_functions(offset=0, limit=200)
+Raw data read:
+- 0x00001030 sym.imp.puts
+- 0x00001040 sym.imp.printf
+- 0x00001050 sym.imp.strcmp
+- 0x00001060 sym.imp.__cxa_finalize
+- 0x00001070 entry0
+- 0x000010a0 fcn.000010a0
+- 0x00001110 entry.fini0
+- 0x00001150 entry.init0
+- 0x00001159 fcn.00001159
+- 0x000011a3 fcn.000011a3
+
+Interpretation:
+- Very small binary with only two non-trivial custom functions likely contains straightforward logic.
+- Presence of strcmp import strongly suggests input-vs-secret string comparison.
+
+Why this matters:
+- In challenge malware, password checks are often implemented as decoded string + strcmp.
+
+Action 1.2: Listed imports
+Tool: user-cutter-list_imports(offset=0, limit=200)
+Raw data read:
+- __libc_start_main
+- puts
+- printf
+- strcmp
+- __cxa_finalize
+- weak runtime symbols (_ITM_*, __gmon_start__)
+
+Interpretation:
+- No crypto/hash imports; suggests simple obfuscation and plaintext compare.
+- strcmp is a direct signal for exact string equality checks.
+
+Action 1.3: Listed exports
+Tool: user-cutter-list_exports(offset=0, limit=200)
+Raw data read:
+- No exports listed
+
+Interpretation:
+- Not relevant for password extraction in this sample.
+
+Action 1.4: Listed linked libraries
+Tool: user-cutter-list_libraries(offset=0, limit=200)
+Raw data read:
+- libc.so.6
+
+Interpretation:
+- Minimal dependencies; supports assumption of simple internal check logic.
+
+============================================================
+2) Decompilation of likely password-check functions
+============================================================
+
+Action 2.1: Decompiled function at 0x00001159
+Tool: user-cutter-decompile_function_by_address(address=0x00001159)
+Raw data read (logic summary):
+- for loop over length arg2
+- byte-wise operation: *(arg1+i) = *(arg1+i) ^ (uint8_t)arg3
+
+Interpretation:
+- This is a generic XOR decoder/transform routine.
+
+Why this matters:
+- Password is likely stored obfuscated and decoded at runtime with this routine.
+
+Action 2.2: Decompiled function at 0x000011a3
+Tool: user-cutter-decompile_function_by_address(address=0x000011a3)
+Raw data read (critical values):
+- Local buffer bytes initialized to:
+  85 8f 82 84 bc 98 af 8a 8d d0 bc bb ac b1 bc d0
+  8d a0 91 9a 93 c8 d2 d3 8d bc 8a c7 bc ad 8c bc
+  93 91 ac 81 af d0 8e c2 9e e3 00
+- Call: fcn.00001159(&s2, 0x2b, 0xffffffe3)
+- Then: iVar1 = strcmp(arg1, &s2)
+- Return: iVar1 == 0
+
+Interpretation:
+- Length 0x2b means 43 bytes decoded (including null terminator arrangement in local buffer).
+- Key 0xffffffe3 cast to uint8_t is 0xE3.
+- Function decrypts buffer with XOR key 0xE3, then compares user input with decrypted plaintext.
+- Therefore decrypted buffer content is the exact required password string.
+
+Action 2.3: Pulled function details for validation
+Tools:
+- user-cutter-show_function_detail(0x00001159)
+- user-cutter-show_function_detail(0x000011a3)
+Raw data read (important parts):
+- 0x1159 args: arg1, arg2, arg3; one loop; called from 0x126c
+- 0x11a3 call-refs include 0x00001159 and strcmp (0x00001050)
+
+Interpretation:
+- Confirms call graph: decode routine + compare routine chain is genuine.
+
+============================================================
+3) Independent decode verification outside Cutter
+============================================================
+
+Action 3.1: Ran local Python to decode bytes with XOR 0xE3
+Command concept:
+- enc = [0x85, 0x8f, ... ,0x9e, 0xe3]
+- plaintext = ''.join(chr(b ^ 0xE3) for b in enc)
+
+Raw data produced:
+- "flag_{Lin3_XOR_3nCryp+10n_i$_No_prObL3m!}\x00"
+- length printed: 42 (for displayed string including terminator handling in script output context)
+
+Interpretation:
+- Trailing \x00 is C-string terminator, not part of password content.
+- Effective password text is:
+  flag_{Lin3_XOR_3nCryp+10n_i$_No_prObL3m!}
+
+Why this matters:
+- Independent decode corroborates decompiler-based inference.
+
+============================================================
+4) Additional control-flow sanity checks
+============================================================
+
+Action 4.1: Decompiled 0x000010a0
+Tool: user-cutter-decompile_function_by_address(0x000010a0)
+Raw data read:
+- function returns immediately (stub)
+
+Interpretation:
+- Not relevant to password logic.
+
+Action 4.2: Decompiled entry function 0x00001070
+Tool: user-cutter-decompile_function_by_address(0x00001070)
+Raw data read:
+- __libc_start_main called with main-like pointer data.00001293
+
+Interpretation:
+- Program has standard startup; primary logic expected in main-like address.
+
+Action 4.3: Looked for cross-references to check function
+Tool: user-cutter-xrefs_to(address=0x000011a3)
+Raw data read:
+- (nofunc) 0x12b6 [CALL] call fcn.000011a3
+
+Interpretation:
+- Confirms this function is actively called by program logic.
+
+Action 4.4: Attempted to inspect 0x00001293 further
+Tools:
+- user-cutter-show_function_detail(0x00001293)
+- user-cutter-decompile_function_by_address(0x00001293)
+- user-cutter-list_functions(offset=200, limit=200)
+Raw data read:
+- No additional function metadata/output returned for 0x1293 in this session.
+- No more functions after offset 200.
+
+Interpretation:
+- Even without decompiling 0x1293, already sufficient evidence:
+  a) xref calls password-check function,
+  b) password-check performs decode + strcmp against user input.
+
+============================================================
+Final extracted shutdown password
+============================================================
+
+flag_{Lin3_XOR_3nCryp+10n_i$_No_prObL3m!}
+
+Confidence
+- High. Derived directly from runtime decode logic and validated with an independent XOR reconstruction.

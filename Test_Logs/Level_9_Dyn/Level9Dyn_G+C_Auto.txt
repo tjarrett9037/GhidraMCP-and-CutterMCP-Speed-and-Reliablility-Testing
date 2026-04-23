@@ -1,0 +1,338 @@
+================================================================================
+MCP MALWARE / CRACKME PASSWORD ANALYSIS — FULL METHODOLOGY LOG
+================================================================================
+Date context: Session documenting reverse-engineering of a Linux x86-64 ELF
+loaded in Ghidra and Cutter. Goal: locate and recover the "password" that
+produces the success path (described by the user as shutdown / kill behavior).
+
+Output artifact: This log file.
+================================================================================
+
+PART 1 — HIGH-LEVEL STRATEGY
+--------------------------------------------------------------------------------
+Reasoning:
+  - Password-style secrets in binaries usually surface as string literals,
+    strcmp/strncmp call sites, or usage banners.
+  - Parallel queries across Ghidra and Cutter MCP tools reduce wall-clock time
+    while cross-checking the same addresses/functions.
+
+Approach:
+  1) Broad string/symbol discovery (password, shutdown, kill, key).
+  2) Follow cross-references from high-signal strings into functions.
+  3) Decompile the validation routine and any crypto/XOR helpers.
+  4) Confirm critical immediates and loop bounds with disassembly (not only
+     decompiler output, which can misname or reorder operations).
+  5) Recover the preimage by modeling the transform and inverting XOR (or by
+     solving the algorithm), then verify by forward encryption.
+
+================================================================================
+PART 2 — STEP-BY-STEP ACTIONS, RAW DATA, INTERPRETATION, RATIONALE
+================================================================================
+
+STEP 1 — Parallel string and symbol discovery
+--------------------------------------------------------------------------------
+Tools invoked:
+  - Ghidra: list_strings with filters "pass", "shut", "kill", "key"
+  - Cutter: search_functions_by_name with query "pass"
+
+Data read (Ghidra — filter "pass"):
+  Address 0x0010304c: "Usage: %s <password>\n"
+
+Data read (Ghidra — filters "shut", "kill", "key"):
+  (no additional matches returned in those specific filtered queries)
+
+Data read (Cutter — search_functions_by_name "pass"):
+  (empty / no matches returned via MCP)
+
+Interpretation:
+  - The usage string proves the program expects a CLI password argument and
+    gives the format for argv usage.
+  - Absence of "shut"/"kill" in those string queries does not mean there is
+    no off-switch; logic may be entirely code-driven with generic messages.
+
+Rationale:
+  - Starting from "pass" is the fastest path to the user-facing entry point.
+
+
+STEP 2 — Expand string context and locate program entry linkage
+--------------------------------------------------------------------------------
+Tool invoked:
+  - Ghidra: list_strings with empty filter (broader listing, limited count)
+
+Data read (representative user-facing / .rodata strings):
+  0x00103004: "/proc"
+  0x0010300a: "/proc/%s/comm"
+  0x0010301a: "You achieved Level 9!"
+  0x00103030: "Sorry, not quite there yet."
+  0x0010304c: "Usage: %s <password>\n"
+
+Interpretation:
+  - Success/failure messages are CTF- or crackme-flavored ("Level 9"), not
+    typical ransomware branding. Still treated as the success/failure branch
+    of the password check for analysis purposes.
+  - "/proc" paths suggest possible anti-analysis or process enumeration (to be
+    confirmed in deeper functions if needed).
+
+Rationale:
+  - Nearby strings anchor emotional/UI behavior to the same validation flow.
+
+
+STEP 3 — Cross-references from the usage string
+--------------------------------------------------------------------------------
+Tool invoked:
+  - Ghidra: get_xrefs_to address 0x0010304c
+
+Data read:
+  From 0x001020cf in FUN_00102075 [DATA]
+  From 0x001020d9 in FUN_00102075 [PARAM]
+
+Interpretation:
+  - FUN_00102075 references the usage format string; treated as the CLI
+    handler (analogous to main’s password path).
+
+Rationale:
+  - Xrefs turn a static string into an actionable function address.
+
+
+STEP 4 — Decompile the CLI handler
+--------------------------------------------------------------------------------
+Tool invoked:
+  - Ghidra: decompile_function_by_address 0x00102075
+  - Cutter: decompile_function_by_address 0x00102075 (for cross-tool check)
+
+Data read (Ghidra decompilation summary):
+  Function: FUN_00102075(int param_1, undefined8 *param_2)
+  Logic:
+    if (param_1 == 2) {
+      local_c = FUN_00101e4c(param_2[1]);   // validate argv[1]
+      if (local_c == 1) puts("You achieved Level 9!");
+      else puts("Sorry, not quite there yet.");
+    } else {
+      printf("Usage: %s <password>\n", *param_2);
+    }
+    return local_c;
+
+Data read (Cutter):
+  MCP returned empty body for this address in this session.
+
+Interpretation:
+  - param_1 is argc-style count; param_2 is argv-style pointer array.
+  - Requirement: argc == 2 exactly (one user-supplied argument).
+  - Core secret verification is entirely inside FUN_00101e4c(argv[1]).
+
+Rationale:
+  - One decompilation pass collapses hundreds of instructions into the call
+    graph decision we care about.
+
+
+STEP 5 — Cross-references to success/failure strings (sanity)
+--------------------------------------------------------------------------------
+Tool invoked:
+  - Ghidra: get_xrefs_to 0x0010301a ("You achieved Level 9!")
+  - Ghidra: get_xrefs_to 0x00103030 ("Sorry, not quite there yet.")
+
+Data read:
+  Both referenced from FUN_00102075 only (DATA/PARAM style xrefs).
+
+Interpretation:
+  - Confirms no alternate hidden success printer elsewhere from this listing.
+
+Rationale:
+  - Quick sanity check that analysis stayed centered on one flow.
+
+
+STEP 6 — Decompile the password validation routine
+--------------------------------------------------------------------------------
+Tool invoked:
+  - Ghidra: decompile_function_by_address 0x00101e4c
+  - Cutter: decompile_function_by_address 0x00101e4c
+
+Data read (Ghidra — structural summary, not every line repeated):
+  - Registers SIGTRAP (signal 5) handler FUN_00101229; then raise(5).
+  - clock_gettime(1, &start)  // CLOCK_MONOTONIC == 1 on Linux
+  - Builds 52-byte constant array local_78[0..0x33] on stack via immediate
+    byte stores (embedded "expected" ciphertext after transform).
+  - Calls FUN_00101df8(); must return 0.
+  - Calls FUN_001015c2(); must return 0.
+  - clock_gettime(1, &end)
+  - Computes elapsed milliseconds; if > 500, returns failure (0).
+  - Copies 52 bytes from input pointer into local_b8:
+        for (i = 0; i < 0x34; i++) local_b8[i] = input[i];
+  - Calls FUN_00101418(local_b8, 0x34, key_constant);
+  - Byte-wise compare local_b8[i] vs local_78[i] for i in 0..0x33;
+    all match => success (1).
+
+Embedded constant local_78 (52 bytes, as read from decompiler):
+  41 9c 6d b9 8d c2 6f af a2 93 48 01 6d 68 9c 11
+  08 4c cc e4 ad 23 30 02 9f e6 92 dc af 83 fd bb
+  8b 7c 40 6a 08 be 04 14 ff cd 62 12 51 5b 58 8c
+  5b c2 bc e3
+
+Interpretation:
+  - This is not a simple strcmp against a plaintext password string.
+  - The input is transformed in-place, then compared to a fixed 52-byte
+    target — classic obfuscation / stream-cipher / XOR-counter pattern.
+  - Anti-debug and anti-tamper: two functions must pass; timing must be
+    under half a second between the two clock_gettime samples (debugger or
+    heavy instrumentation can fail this even with a correct password).
+  - raise(SIGTRAP) + handler likely flips a global so FUN_00101418 takes the
+    "real" path instead of a memset wipe path (see next step).
+
+Rationale:
+  - Decompiler exposes algorithm class before spending time on assembly.
+
+
+STEP 7 — Decompile the transform and trap handler
+--------------------------------------------------------------------------------
+Tools invoked:
+  - Ghidra: decompile_function_by_address 0x00101418 (FUN_00101418)
+  - Ghidra: decompile_function_by_address 0x00101229 (FUN_00101229)
+  - Cutter: decompile_function_by_address 0x00101418
+
+Data read (FUN_00101229):
+  Sets DAT_00105090 = 0; returns.
+
+Data read (FUN_00101418 — conceptual):
+  - Expands 64-bit key param_3 into eight bytes, then four uint16 key words.
+  - Iterates in 8-byte chunks over buffer length param_2.
+  - For each chunk:
+      * Forms 4x uint16 state words from a 64-bit block counter local_18.
+      * Calls FUN_0010129e(key_words, state_words) to mix state.
+      * XORs each of up to 8 bytes with selected bytes derived from the
+        mixed state words (high/low byte extraction pattern).
+      * If DAT_00105090 != 0, breaks and memset’s buffer to zero (failure).
+
+Interpretation:
+  - Transform is XOR with a pseudorandom keystream generated from:
+      (a) static 64-bit key material, and
+      (b) a per-8-byte-block incrementing counter.
+  - XOR is self-inverse: if C = P ^ K then P = C ^ K for the same K.
+  - Therefore recovering keystream K on zero input yields K, and P = C ^ K.
+
+Rationale:
+  - Once XOR structure is identified, inversion does not require breaking a
+    one-way hash — only faithful keystream reproduction.
+
+
+STEP 8 — Decompile keystream round function and 16-bit mix primitive
+--------------------------------------------------------------------------------
+Tool invoked:
+  - Ghidra: decompile_function_by_address 0x0010129e
+  - Ghidra: decompile_function_by_address 0x0010123d
+
+Data read (FUN_0010129e — pattern):
+  Eight rounds; each round applies FUN_0010123d repeatedly on 16-bit words
+  with additions and XORs between four working registers.
+
+Data read (FUN_0010123d):
+  16-bit multiply with high/low folding and a correction when product > 0xFFFF
+  (IDEA-like multiplication mod 2^16+1 style, specialized for zero cases in
+  this implementation).
+
+Interpretation:
+  - Keystream generation is a custom ARX/MUL mix on 64 bits of state per block,
+    not a named standard invoked by import table alone.
+
+Rationale:
+  - For recovery, exact bitwise behavior matters; decompiler guided which
+    helper to reimplement first.
+
+
+STEP 9 — Disassemble validation routine to verify immediates and bounds
+--------------------------------------------------------------------------------
+Tool invoked:
+  - Ghidra: disassemble_function starting at 0x00101e4c
+
+Critical assembly observations recorded:
+  - MOV RDX, 0x123456789abcdef immediately before CALL FUN_00101418
+    => 64-bit key literal used by the transform (not a different constant).
+  - Copy loop compares index against 0x33 with JLE => 52 bytes (indices 0..51).
+  - Compare loop likewise runs through 0x33 => 52-byte full compare.
+  - Timing check compares computed millisecond delta against 0x1F4 (500 decimal).
+
+Interpretation:
+  - Decompiler’s 0x34 (52) length and key constant are confirmed in machine
+    code, removing ambiguity about truncation or a different immediate.
+
+Rationale:
+  - Decompilers occasionally mis-parenthesize XOR/add precedence; assembly
+    here was used specifically to lock the key immediate and loop counts.
+
+
+STEP 10 — External verification via Python simulation
+--------------------------------------------------------------------------------
+Environment: local python3 executed in the analysis shell (not an MCP tool).
+
+Actions:
+  1) Implemented FUN_0010123d, FUN_0010129e, and FUN_00101418 semantics in
+     Python with explicit uint16 masking and C-like operator precedence
+     where it mattered for XOR/add ordering derived from decompiler/assembly.
+  2) Treated encryption as: output = input XOR keystream_block.
+  3) Computed keystream by running the transform on an all-zero 52-byte buffer
+     with KEY = 0x123456789abcdef (same numeric value as in disassembly).
+  4) Recovered plaintext P = C XOR keystream where C is the 52-byte embedded
+     constant from Step 6.
+  5) Forward check: re-ran transform on P and compared to C.
+
+Data read / produced (keystream, hex):
+  66e941c7dc9487a77183f2dab7729a91fea2f78768cff7df7b548db4bd1f6bec077372bd52e5c2a79cab5ae9ce3895df0aedb82f
+
+Data produced (recovered password / preimage P, 52 bytes, hex):
+  27752c7e5156e808d310badbda1a0680f6ee3b63c5ecc7dde4b21f68129c96578c0f32d75a5bc6b3636638fb9f63cd53512f04cc
+
+Verification result:
+  re-encrypt(transform(P)) == C  => True
+
+Additional properties checked:
+  - No 0x00 byte appears in P (so a single argv string does not truncate early
+    for typical C string APIs that stop at NUL — still note: passing arbitrary
+    binary via shell may require printf/xxd patterns).
+
+Interpretation:
+  - The preimage is not a memorable English passphrase; it is a fixed 52-byte
+    binary secret determined by the stream generator and embedded constant.
+  - Base64 representation (for transport/logging):
+      J3UsflFW6AjTELrb2hoGgPbuO2PF7Mfd5LIfaBKclleMDzLXWlvGs2NmOPufY81TUS8EzA==
+
+Rationale:
+  - Independent re-encryption is the strongest consistency check short of
+    executing the original binary under controlled conditions.
+
+
+================================================================================
+PART 3 — TOOLING NOTES (GHIDRA VS CUTTER MCP)
+================================================================================
+Ghidra MCP:
+  - Provided strings, xrefs, decompilation, and disassembly successfully for
+    all queried addresses in this session.
+
+Cutter MCP:
+  - search_functions_by_name("pass") returned no matches.
+  - decompile_function_by_address for key addresses returned empty content in
+    this session.
+  - disassemble_function for 0x00102014 returned empty in this session.
+  Interpretation:
+  - For this workspace/session, Ghidra was the reliable MCP source; Cutter
+    either was not attached to the same database, lacked permissions, or the
+    bridge returned no payload. Analysis accuracy therefore relied on Ghidra
+    plus executable-independent algebraic verification (Python re-encrypt).
+
+
+================================================================================
+PART 4 — OPERATIONAL CAVEATS FOR LIVE EXECUTION
+================================================================================
+Even with the correct 52-byte input:
+  - FUN_00101df8 and FUN_001015c2 must both return 0 (anti-debug / ptrace-style
+    logic per high-level decompilation — details not fully expanded in this
+    log).
+  - Elapsed wall time between the two clock_gettime calls must be <= 500 ms.
+  - The SIGTRAP handler must run so DAT_00105090 is cleared; otherwise
+    FUN_00101418 may zero the buffer and guarantee failure.
+
+Researchers testing behavior should plan for patching, controlled execution, or
+a harness that satisfies timing and anti-analysis checks.
+
+
+================================================================================
+END OF LOG
+================================================================================

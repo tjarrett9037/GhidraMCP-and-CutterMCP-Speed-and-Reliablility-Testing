@@ -1,0 +1,195 @@
+Ransomware Password Recovery Log (Level 4)
+Date: 2026-04-08
+Analyst: Cursor Agent (Ghidra + Cutter MCP)
+
+Objective
+- Find the password checked by the sample for its "shutdown"/success path.
+- Validate by tracing actual code execution and reconstructing the expected input.
+
+Scope and methodology
+- Use both Ghidra and Cutter MCP tools to cross-check findings.
+- Prefer control-flow + data-flow confirmation over string-only guesses.
+- Confirm final candidate by reproducing the algorithm in an external script.
+
+============================================================
+STEP-BY-STEP TRANSCRIPT WITH DATA, INTERPRETATION, AND WHY
+============================================================
+
+Step 1: Initial triage for likely credential-related strings
+Why:
+- Password checks often expose nearby usage/help strings or status text.
+- Quick way to locate entry points before deeper analysis.
+
+Commands and outputs read:
+1) Ghidra list_strings(filter="pass")
+   Output:
+   - 00102036: "Usage: %s <password>\n"
+
+2) Ghidra list_strings(filter="shutdown")
+   Output:
+   - (no result)
+
+3) Ghidra list_strings(filter="kill")
+   Output:
+   - (no result)
+
+Interpretation:
+- Strong indicator the binary accepts a single CLI password argument.
+- No explicit "shutdown" or "kill" plaintext string, implying check is likely indirect/obfuscated.
+
+
+Step 2: Import table inspection (both tools)
+Why:
+- Imported libc functions reveal likely verification style (string compare, crypto helpers, etc.).
+
+Commands and outputs read:
+1) Cutter list_imports(limit=200)
+   Output included:
+   - __libc_start_main
+   - puts
+   - printf
+   - memcmp
+   - memcpy
+   - __cxa_finalize
+   - _ITM_* and __gmon_start__
+
+2) Ghidra list_imports(limit=200)
+   Output confirmed same imports:
+   - __libc_start_main, puts, printf, memcmp, memcpy, ...
+
+Interpretation:
+- Presence of memcmp + memcpy strongly suggests "transform input then compare raw bytes."
+- No high-level crypto library imports; likely custom/small embedded routine.
+
+
+Step 3: Locate verification function via xrefs
+Why:
+- Find where memcmp is called to identify the actual password check function.
+
+Commands and outputs read:
+1) Ghidra list_functions()
+   Output (relevant subset):
+   - FUN_00101169 at 00101169
+   - FUN_0010144d at 0010144d
+   - FUN_0010157f at 0010157f
+   - external stubs for memcmp/memcpy/printf/puts
+
+2) Ghidra get_function_xrefs(name="memcmp", limit=50)
+   Output:
+   - From 00101570 in FUN_0010144d [UNCONDITIONAL_CALL]
+   - Data reference entries (PLT/GOT related)
+
+Interpretation:
+- Core compare occurs in FUN_0010144d.
+- Next action: decompile FUN_0010144d and its callee(s).
+
+
+Step 4: Decompile compare routine and inspect disassembly
+Why:
+- Need exact constant bytes, transform call, key material, and compare length.
+
+Commands and outputs read:
+1) Ghidra decompile_function_by_address(0x0010144d)
+   Key extracted facts:
+   - Function signature: bool FUN_0010144d(void *param_1)
+   - Builds 49-byte local byte array (0x31 bytes), values include:
+     bf 2b 00 b8 51 2d 62 39 37 65 78 41 b4 7c 65 8c ...
+     ... e6 9d 71 16
+   - memcpy(local_88,&local_48,0x31)
+   - Calls FUN_00101169(local_88,0x31,0x1d6796e070c749b7)
+   - Calls memcmp(local_88,param_1,0x31)
+   - Returns true if memcmp == 0
+
+2) Ghidra disassemble_function(0x0010144d)
+   Key assembly-level confirmations:
+   - MOV RDX,0x1d6796e070c749b7 before call to FUN_00101169
+   - MOV EDX,0x31 before memcmp call
+   - CALL 0x00101050 (memcmp PLT)
+
+3) Cutter decompile_function_by_address(0x0010144d)
+   Output:
+   - No decompilation returned through MCP for this call
+
+Interpretation:
+- This routine does NOT compare to plaintext; it decrypts/transforms an embedded blob first.
+- Required input length is exactly 49 bytes.
+- Constant key and ciphertext-like array are present in code.
+
+
+Step 5: Identify argument wiring in main-like function
+Why:
+- Confirm the password source is argv[1], and map success/failure messages.
+
+Commands and outputs read:
+1) Ghidra decompile_function_by_address(0x0010157f)
+   Output logic:
+   - if argc == 2:
+       local_c = FUN_0010144d(argv[1]);
+       if local_c == 1 -> puts("You achieved Level 4!");
+       else -> puts("Sorry, not quite there yet.");
+     else:
+       printf("Usage: %s <password>\n", argv[0]);
+
+Interpretation:
+- Definitively confirms command-line password check path.
+- "You achieved Level 4!" message corresponds to valid password.
+
+
+Step 6: Reverse the transform function to recover expected plaintext
+Why:
+- Must derive true password from transformed bytes and key.
+
+Commands and outputs read:
+1) Ghidra decompile_function_by_address(0x00101169)
+   Key extracted behavior:
+   - Initializes S-box 0..255
+   - Performs key scheduling over 256 rounds
+   - Generates keystream bytes
+   - XORs keystream with input buffer in place
+   - Uses 8-byte key material derived from param_3
+
+2) Cutter decompile_function_by_address(0x00101169)
+   Output:
+   - No decompilation returned through MCP for this call
+
+Interpretation:
+- Algorithm is RC4-like (KSA + PRGA + XOR stream).
+- Since function XORs in place, same routine "decrypts" embedded bytes into expected password.
+
+
+Step 7: Reconstruct algorithm externally and decode password
+Why:
+- Convert static reverse-engineering into a deterministic, reproducible result.
+
+Command and output read:
+1) Shell: Python script implementing RC4-style routine with:
+   - key = 0x1d6796e070c749b7 (used as little-endian 8-byte array)
+   - ciphertext bytes = 49-byte constants from FUN_0010144d
+   Output:
+   - hex: 666c61675f7b4c696e345f443362756767316e675f69535f4d7563485f6640357433725f466f725f746831245f4f6e33217d
+   - repr: b'flag_{Lin4_D3bugg1ng_iS_MucH_f@5t3r_For_th1$_On3!}'
+   - ascii: flag_{Lin4_D3bugg1ng_iS_MucH_f@5t3r_For_th1$_On3!}
+
+Interpretation:
+- Recovered password is:
+  flag_{Lin4_D3bugg1ng_iS_MucH_f@5t3r_For_th1$_On3!}
+- Length matches 0x31 bytes, matching memcmp length.
+- Character set and structure strongly indicate intentional challenge flag/password format.
+
+
+Final validated answer
+- Password:
+  flag_{Lin4_D3bugg1ng_iS_MucH_f@5t3r_For_th1$_On3!}
+
+Confidence assessment
+- High confidence.
+- Justification:
+  1) Direct control-flow to compare function established.
+  2) Compare length and transformed buffer confirmed in assembly/decompilation.
+  3) Algorithm reverse-engineered from function body.
+  4) Deterministic decode output obtained and format-consistent.
+  5) Dual-tool corroboration on imports/function map; Ghidra provided key decompilation detail.
+
+Notes on data quality
+- Some Cutter decompile calls for specific functions returned no content via MCP.
+- This did not affect correctness because Ghidra provided complete decompilation and Cutter confirmed supporting context (imports and symbol landscape).

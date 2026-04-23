@@ -1,0 +1,151 @@
+Ransomware Password Discovery Log
+Date: 2026-04-08
+Analyst: Cursor AI assistant
+Objective: Find a shutdown/kill password embedded in the loaded malware sample using both Ghidra and Cutter.
+
+================================================================
+1) Initial Hypothesis and Search Strategy
+================================================================
+Hypothesis:
+- If a password-based shutdown/kill-switch exists, likely indicators are:
+  - User-facing prompt strings (e.g., "password", "usage")
+  - String comparison APIs (`strcmp`, `strncmp`, etc.)
+  - Branches in `main` or argument-handling code
+
+Why this strategy:
+- This is the fastest high-signal path for C/C++ ELF challenge-style malware/reversing binaries.
+- It minimizes noise and quickly confirms whether the password is hardcoded or computed.
+
+================================================================
+2) Data Collection: Initial Broad Indicators
+================================================================
+Tool call:
+- Ghidra: list strings filtered by "password"
+Data read:
+- 0010206f: "Usage: %s <password>\n"
+Interpretation:
+- Strong evidence command-line password input is expected.
+- Anchor address for cross-reference tracing.
+
+Tool call:
+- Ghidra: list strings filtered by "shutdown"
+Data read:
+- No results returned.
+Interpretation:
+- No explicit "shutdown" keyword in plaintext strings.
+- Does NOT rule out shutdown behavior; only rules out obvious literal text.
+
+Tool call:
+- Ghidra: list strings filtered by "stop"
+Data read:
+- No results returned.
+Interpretation:
+- Same as above: no direct plaintext stop string.
+
+Tool call:
+- Cutter: list imports
+Data read:
+- __libc_start_main
+- puts
+- printf
+- strcmp
+- __cxa_finalize
+- _ITM_deregisterTMCloneTable
+- _ITM_registerTMCloneTable
+- __gmon_start__
+Interpretation:
+- Presence of `strcmp` strongly supports literal password comparison logic.
+
+Tool call:
+- Ghidra: list imports
+Data read:
+- Same relevant imports as Cutter, including `strcmp`.
+Interpretation:
+- Cross-tool consistency validated.
+
+================================================================
+3) Data Collection: Cross-References to Likely Controls
+================================================================
+Tool call:
+- Ghidra: xrefs to 0x0010206f (the "Usage: %s <password>\n" string)
+Data read:
+- From 001011bd in main [DATA]
+- From 001011c7 in main [PARAM]
+Interpretation:
+- The usage/password prompt is referenced directly in `main`.
+- Confirms password handling likely implemented in main argument logic.
+
+Tool call:
+- Ghidra: function xrefs for "strcmp"
+Data read:
+- From 00101186 in main [UNCONDITIONAL_CALL]
+- Additional loader/plumbing refs not relevant to logic path.
+Interpretation:
+- Main directly calls `strcmp`; likely the credential check.
+
+Tool call:
+- Cutter: xrefs to 0x00001050 (strcmp import thunk)
+Data read:
+- main 0x1186 [CALL] call strcmp
+Interpretation:
+- Independent confirmation in Cutter that `main` performs string compare.
+
+================================================================
+4) Data Collection: Decompilation of Main Logic
+================================================================
+Tool call:
+- Ghidra: decompile function "main"
+Data read:
+- if (param_1 == 2) {
+-   local_c = strcmp((char *)param_2[1], "flag_{Lin1_Th4tS_wHy_y0u_@Lw4y5_$t4rT_w1tH_stR!n6$!}");
+-   if (local_c == 0) puts("You achieved Level 1!");
+-   else puts("Sorry, not quite there yet.");
+- } else {
+-   printf("Usage: %s <password>\n", *param_2);
+- }
+Interpretation:
+- Exact credential check is hardcoded in `strcmp`.
+- Successful match branch clearly defined by `local_c == 0`.
+
+Tool call:
+- Cutter: decompile around address 0x1186 / main
+Data read:
+- var_ch = strcmp(argv[1], "flag_{Lin1_Th4tS_wHy_y0u_@Lw4y5_$t4rT_w1tH_stR!n6$!}");
+- if (var_ch == 0) puts("You achieved Level 1!");
+- else puts("Sorry, not quite there yet.");
+Interpretation:
+- Same constant string and logic seen in Ghidra.
+- Confirms no decompiler artifact discrepancy.
+
+Tool call:
+- Cutter: function detail (main at 0x1159)
+Data read (relevant):
+- name: main
+- data-refs include addresses corresponding to compared string and usage string
+- call-refs include strcmp/puts/printf path
+Interpretation:
+- Structural metadata is consistent with decompilation conclusions.
+
+================================================================
+5) Final Conclusion
+================================================================
+Recovered password:
+flag_{Lin1_Th4tS_wHy_y0u_@Lw4y5_$t4rT_w1tH_stR!n6$!}
+
+Confidence:
+- High.
+- Reason: independently recovered and validated in both Ghidra and Cutter from the same `strcmp(argv[1], <literal>)` logic in `main`.
+
+================================================================
+6) Why This Was Considered Accurate
+================================================================
+1. The string is not inferred; it is directly embedded as a literal argument to `strcmp`.
+2. The branch condition checks `strcmp == 0`, the canonical exact-match success condition.
+3. Both tools produced matching decompilation output for this core logic.
+4. Supporting evidence (usage string + imports + xrefs) aligns with the same code path.
+
+================================================================
+7) Notes / Scope Limits
+================================================================
+- This log identifies the password gate present in `main` for the observed level behavior ("You achieved Level 1!").
+- It does not assert this is the only secret in the binary; additional staged checks may exist elsewhere.

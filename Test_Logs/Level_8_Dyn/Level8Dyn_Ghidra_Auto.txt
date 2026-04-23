@@ -1,0 +1,172 @@
+Malware Password Recovery Log (Level 8)
+Date: 2026-03-31
+Analyst: Cursor AI assistant via Ghidra MCP
+
+Scope
+- Objective: Find the hardcoded password that passes the malware's shutdown/password check.
+- Method: Static reverse engineering in Ghidra + local script to reverse a cipher transform.
+
+Important note about this log
+- This document captures the exact technical actions, artifacts, and conclusions used to reach the answer.
+- It does not include private internal chain-of-thought content; it includes externally verifiable analysis steps.
+
+========================================================================
+1) Initial triage: inspect strings/imports/exports
+========================================================================
+
+Action
+- Queried Ghidra for:
+  - all strings
+  - imported symbols
+  - exported symbols
+
+Data read (key excerpts)
+- Strings:
+  - "Usage: %s <password>\n"
+  - "You achieved Level 8!"
+  - "Sorry, not quite there yet."
+  - "expand 8-byte k"
+  - "/proc"
+  - "/proc/%s/comm"
+- Imports included:
+  - strcmp, memcmp, snprintf, fgets, strlen
+  - ptrace, signal, raise
+  - opendir, readdir, fopen, fclose, closedir
+- Exports included:
+  - entry at 0x00101160
+  - _INIT/_FINI symbols
+
+Interpretation and why it mattered
+- Presence of "<password>" usage text strongly indicates command-line password verification.
+- Success/fail strings indicate a branch-based credential check.
+- "expand 8-byte k" is a classic Salsa-family constant, suggesting encrypted/obfuscated comparison data.
+- ptrace/signal/raise and /proc scanning suggest anti-debugging/anti-analysis controls.
+
+========================================================================
+2) Locate comparison/check pathways
+========================================================================
+
+Action
+- Listed all functions.
+- Pulled cross-references (xrefs) to strcmp, memcmp, and snprintf.
+
+Data read
+- Major xrefs:
+  - strcmp: many calls from FUN_001016f2
+  - snprintf: from FUN_001016f2
+  - memcmp: from FUN_00101f7c
+
+Interpretation and why it mattered
+- FUN_001016f2 likely performs process-name checks (anti-analysis) because it uses /proc + strcmp repeatedly.
+- memcmp xref in FUN_00101f7c strongly suggested this function performs the final password validation.
+
+========================================================================
+3) Decompile high-value functions
+========================================================================
+
+Action
+- Decompiled:
+  - FUN_00101f7c
+  - FUN_001016f2
+  - FUN_0010154d
+  - FUN_00101f28
+  - FUN_001021b8
+  - FUN_0010125d
+- Disassembled FUN_0010154d to verify byte/word layout and state setup details.
+
+Data read and interpretation
+
+3.1) FUN_001021b8 (main-like wrapper)
+- Logic:
+  - if argc == 2: call FUN_00101f7c(argv[1])
+  - if true: puts("You achieved Level 8!")
+  - else: puts("Sorry, not quite there yet.")
+  - else branch: printf("Usage: %s <password>\n", argv[0])
+- Why important:
+  - Confirms argv[1] is the password candidate and FUN_00101f7c is the validator.
+
+3.2) FUN_00101f7c (core validator)
+- Notable behavior:
+  - anti-debug/timing checks first:
+    - signal/raise interaction
+    - ptrace check via FUN_00101f28
+    - process scan via FUN_001016f2
+    - elapsed time check (< 500 ms)
+  - then copies input bytes into local buffer
+  - calls FUN_0010154d(buffer, 0x35, 0x9988776655443322)
+  - memcmp(transformed_input, hardcoded_53_bytes, 0x35)
+- Hardcoded 53-byte target blob:
+  c2 d4 e1 49 bd 6f b4 61 93 3f 77 26 b1 ff 4f e1
+  9f 50 03 43 8a c8 65 95 71 1f 9e a5 ab 4e a4 23
+  45 08 61 11 64 c8 ff 41 66 bb fa 40 2c 56 b8 ce
+  61 be 96 0d 35
+- Why important:
+  - This function defines the exact transform and comparison target.
+  - Recovery problem is: invert transform to recover original plaintext input.
+
+3.3) FUN_0010154d (transform routine)
+- Behavior:
+  - Constructs a 16-word state containing:
+    - words from "expand 8-byte k"
+    - repeated 8-byte key derived from 0x9988776655443322
+    - block counter in state words
+    - remaining words zeroed
+  - Calls FUN_0010125d to generate 64-byte keystream blocks
+  - XORs keystream into data buffer (stream-cipher style)
+- Why important:
+  - XOR stream transform is reversible by applying same keystream again.
+
+3.4) FUN_0010125d (keystream core)
+- Behavior:
+  - 10 double-rounds of ARX operations (add-rotate-xor) across 16 words
+  - final addition of original state
+- Why important:
+  - Confirms Salsa-like block function and rotation constants.
+  - Enough to reimplement exactly and decrypt expected plaintext.
+
+3.5) FUN_001016f2 (anti-analysis process-name scan)
+- Reads /proc/<pid>/comm and compares against tools:
+  - gdb, lldb, radare2, ida64, cutter, strace, ltrace, valgrind, binaryninja, edb
+- Why important:
+  - Explains false negatives when running under common tooling.
+  - Not required to recover static password directly.
+
+3.6) FUN_00101f28 (ptrace anti-debug)
+- ptrace(PTRACE_TRACEME) check; detects debugger presence.
+- Why important:
+  - Another reason dynamic testing may fail under debugger.
+
+========================================================================
+4) Recreate transform and recover plaintext
+========================================================================
+
+Action
+- Wrote and ran a local Python script that:
+  - reimplemented the FUN_0010125d ARX core
+  - built FUN_0010154d-compatible initial state using:
+    - constant: "expand 8-byte k" (+ NUL in 16-byte layout)
+    - key: 0x9988776655443322 (as bytes 99 88 77 66 55 44 33 22)
+    - block counter starting at 0
+  - XOR-decrypted the 53-byte hardcoded blob
+
+Observed output
+- bytearray output:
+  bytearray(b'flag_{Lin8_C@n_y0u_M4k3_a_b1n@ry_Pr!nt_!t$_0wn_Fl4g?}')
+- decoded ASCII:
+  flag_{Lin8_C@n_y0u_M4k3_a_b1n@ry_Pr!nt_!t$_0wn_Fl4g?}
+
+Interpretation and why it mattered
+- This is the exact plaintext that, when transformed by the malware routine, matches the embedded comparison blob.
+- Therefore it is the required password.
+
+========================================================================
+5) Final result
+========================================================================
+
+Recovered password
+- flag_{Lin8_C@n_y0u_M4k3_a_b1n@ry_Pr!nt_!t$_0wn_Fl4g?}
+
+Confidence
+- High (deterministically recovered from comparison target + verified transform reconstruction).
+
+End of log.

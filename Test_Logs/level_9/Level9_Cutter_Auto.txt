@@ -1,0 +1,67 @@
+RANSOMWARE PASSWORD RECOVERY WALKTHROUGH (THIS SESSION)
+Date: 2026-04-08
+Target analyzed in Cutter: /home/kali/Documents/MCPTesting/Test_Files/Working_files/CutterMCP_Solves/Lin9_2026
+
+Goal
+- Recover the shutdown password from the loaded ransomware sample.
+
+1) Enumerated code surface with Cutter MCP
+- Calls: list_functions, list_imports, list_exports
+- Read data: huge stripped function table (fcn.0040...), entry0 at 0x00401660; imports/exports yielded no useful named clues.
+- Interpretation: stripped/static style binary; must trace from entry and isolate custom logic.
+- Why: no meaningful symbols to search for "password" directly.
+
+2) Confirmed binary properties
+- Calls: list_libraries, show_headers
+- Read data: ELF64 EXEC, x86-64, stripped=true, static=true, NX=true, PIE=false, entry=0x00401660.
+- Interpretation: runtime-heavy startup expected before malware logic.
+- Why: focus effort on control-flow rather than symbols.
+
+3) Traced startup chain
+- Calls: decompile(0x00401660), decompile(0x00404b70), decompile(0x00402b30)
+- Read data:
+  - entry0 -> fcn.00404b70 then infinite loop.
+  - fcn.00404b70 does runtime init then calls fcn.00402b30.
+  - fcn.00402b30 does function-pointer invocation + runtime bookkeeping.
+- Interpretation: these are bootstrap/runtime wrappers, not the direct password compare.
+- Why: needed to separate framework code from payload code.
+
+4) Located concrete verifier routine
+- Calls: disassemble(0x004023a8), decompile/disassemble nearby helpers (0x00402354)
+- Read data in 0x004023a8:
+  - Embedded 52-byte target array:
+    41 9c 6d b9 8d c2 6f af a2 93 48 01 6d 68 9c 11
+    08 4c cc e4 ad 23 30 02 9f e6 92 dc af 83 fd bb
+    8b 7c 40 6a 08 be 04 14 ff cd 62 12 51 5b 58 8c
+    5b c2 bc e3
+  - Copies exactly 0x34 (52) user bytes.
+  - Calls fcn.00401974(buf, 0x34, 0x0123456789abcdef).
+  - Compares transformed buf to embedded bytes; success only on full match.
+- Interpretation: this is the shutdown-password check.
+- Why: gives exact compare bytes, length, and transform key.
+
+5) Recovered transform internals
+- Calls: decompile/disassemble 0x00401974, decompile 0x004017fa, decompile 0x00401799
+- Read data:
+  - 0x00401974 builds key words from 0x0123456789abcdef.
+  - Generates per-block keystream from a counter via 0x004017fa.
+  - XORs keystream with buffer.
+  - 0x004017fa performs 8 rounds of 16-bit mixing using helper 0x00401799.
+- Interpretation: deterministic XOR stream transform; XOR symmetry means same operation decrypts.
+- Why: allows exact plaintext recovery from stored target bytes.
+
+6) Reimplemented algorithm and decoded password
+- Call: local Python script via shell.
+- Input data to script: the 52-byte embedded target + key 0x0123456789abcdef.
+- Script output read:
+  - len 52
+  - hex: 666c61675f7b4c696e395f496e6c316e216e675f46754e632b31306e355f69245f556731795f6255745f24304c7634624c332e7d
+  - utf8: flag_{Lin9_Inl1n!ng_FuNc+10n5_i$_Ug1y_bUt_$0Lv4bL3.}
+- Interpretation: this is the exact required plaintext input to pass the checker.
+- Why: direct derivation from verifier logic is high confidence.
+
+Recovered shutdown password
+flag_{Lin9_Inl1n!ng_FuNc+10n5_i$_Ug1y_bUt_$0Lv4bL3.}
+
+Confidence
+High - exact extraction from validator code path and algorithmic reversal with matching length/format.

@@ -1,0 +1,105 @@
+Ransomware Password Recovery Log
+Date: 2026-04-07
+Environment: Cutter MCP tools
+
+Scope
+- Objective: Identify the password/check string embedded in the loaded binary.
+- Method: Static analysis only via Cutter MCP function/import/export/decompile endpoints.
+
+Action Log (Chronological)
+
+1) Enumerated program functions
+- Tool: user-cutter-list_functions(offset=0, limit=200)
+- Data returned:
+  - 0x00001000 sym._init
+  - 0x00001030 sym.imp.puts
+  - 0x00001040 sym.imp.printf
+  - 0x00001050 sym.imp.strcmp
+  - 0x00001060 sym.imp.__cxa_finalize
+  - 0x00001070 entry0
+  - 0x000010a0 sym.deregister_tm_clones
+  - 0x000010d0 sym.register_tm_clones
+  - 0x00001110 sym.__do_global_dtors_aux
+  - 0x00001150 entry.init0
+  - 0x00001159 sym.check_password
+  - 0x0000123e main
+  - 0x000012b0 sym._fini
+- Interpretation:
+  - The symbol name `check_password` is highly relevant for credential validation.
+  - `main` and `check_password` are likely the minimal path to derive the secret.
+- Why this mattered:
+  - Prioritized reverse-engineering effort onto likely authentication code paths.
+
+2) Enumerated imported symbols
+- Tool: user-cutter-list_imports(offset=0, limit=200)
+- Data returned (relevant subset):
+  - __libc_start_main
+  - puts
+  - printf
+  - strcmp
+  - __cxa_finalize
+- Interpretation:
+  - Presence of `strcmp` indicates direct string equality checks are likely used.
+- Why this mattered:
+  - Suggested that a plaintext or reconstructed string may be compared against user input.
+
+3) Enumerated exported symbols
+- Tool: user-cutter-list_exports(offset=0, limit=200)
+- Data returned (relevant subset):
+  - 0x0000123e main (FUNC)
+  - 0x00001159 check_password (FUNC)
+  - Standard ELF runtime symbols
+- Interpretation:
+  - Confirms function addresses to target for decompilation.
+- Why this mattered:
+  - Enables precise decompile calls against authentication logic.
+
+4) Decompiled `check_password` at 0x00001159
+- Tool: user-cutter-decompile_function_by_address(address=0x00001159)
+- Data returned (key logic):
+  - Function constructs a byte sequence on stack:
+    - `s2._0_1_ = 0x66` ('f')
+    - `s2._1_1_ = 0x6c` ('l')
+    - `s2._2_1_ = 0x61` ('a')
+    - ...
+    - many subsequent bytes assigned into stack locals
+    - final terminator `var_ah = 0`
+  - Compares user argument with constructed string:
+    - `iVar1 = strcmp(arg1, &s2);`
+    - `return iVar1 == 0;`
+- Interpretation:
+  - The function creates the expected password in memory and performs exact equality check.
+  - Reassembling bytes in order yields the target password string.
+- Why this mattered:
+  - This is the definitive source of truth for the required password.
+
+5) Decompiled `main` at 0x0000123e
+- Tool: user-cutter-decompile_function_by_address(address=0x0000123e)
+- Data returned (key logic):
+  - If `argc == 2`, call `check_password(argv[1])`.
+  - On failure: `puts("Sorry, not quite there yet.");`
+  - On success: `puts("You achieved Level 2!");`
+  - Else: usage text.
+- Interpretation:
+  - Confirms one command-line argument is validated by `check_password`.
+  - Confirms success/failure control flow tied to that string check.
+- Why this mattered:
+  - Verifies the recovered value is the intended trigger for success path.
+
+Recovered Password
+- `flag_{Lin2_WhY_1S_th!$_sTr1n9_h@rD3r_T0_fiNd?}`
+
+How the password was reconstructed
+- Converted each assigned hex byte in `check_password` to ASCII in assignment order.
+- Included all characters up to the null terminator.
+- Ensured result matches `strcmp`-style C string semantics.
+
+Confidence Assessment
+- High confidence.
+- Justification:
+  - Direct decompiled evidence of exact `strcmp` against a fully materialized string.
+  - `main` confirms this function gates success behavior.
+
+Notes
+- Decompiler warnings about variable overlap were present, but they did not alter the visible byte assignments or comparison call.
+- Analysis was static; no dynamic execution required to recover the password.

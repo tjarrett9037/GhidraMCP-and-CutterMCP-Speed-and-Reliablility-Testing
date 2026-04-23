@@ -1,0 +1,265 @@
+Ransomware Password Recovery - Full Methodology and Data Log
+Date: 2026-03-31
+Analyst: Cursor AI agent (Ghidra MCP-assisted)
+
+========================================================================
+1) Objective
+========================================================================
+User request: Find a password embedded in a ransomware sample loaded in Ghidra, believed to shut down malware behavior.
+
+Approach selected:
+- Identify likely password-handling logic via strings and cross-references.
+- Locate code path that compares user input with hidden expected value.
+- Reconstruct or decrypt expected value.
+- Validate recovered value.
+
+
+========================================================================
+2) Exact Step-by-Step Actions, Data Read, Interpretation, and Why
+========================================================================
+
+-----------------------------------------------------------------------
+Step 1 - Enumerate likely clues quickly (strings/imports/function names)
+-----------------------------------------------------------------------
+Tools used (parallel):
+1) user-ghidra-list_strings(limit=2000)
+2) user-ghidra-search_functions_by_name(query="pass", limit=200)
+3) user-ghidra-search_functions_by_name(query="strcmp", limit=200)
+4) user-ghidra-list_imports(limit=500)
+
+Raw data read:
+- Function search for "pass": "No functions matching 'pass'"
+- Function search for "strcmp": "No functions matching 'strcmp'"
+- Imports listing: empty/no actionable imports returned in this call.
+
+- Strings listing (very large output; I read the returned list). Key high-signal entries:
+  * 0x00477042: "Usage: %s <password>\n"
+  * 0x0047700e: "@@You achieved Level 6!"
+  * 0x00477026: "Sorry, not quite there yet."
+  * Many glibc/runtime strings (noise), indicating static-linked/bundled libc content.
+
+Interpretation:
+- The binary clearly accepts one password-like CLI argument due to "Usage: %s <password>\n".
+- Success and failure messages indicate a boolean password check path.
+- Absence of obvious pass/strcmp symbol names suggests stripped binary and/or inlined compare logic.
+
+Why this led to next step:
+- The shortest path is to resolve cross-references to the success/failure/usage strings and jump directly to the validation function.
+
+
+-----------------------------------------------------------------------
+Step 2 - Resolve xrefs from key strings to locate validation routine
+-----------------------------------------------------------------------
+Tools used (parallel):
+1) user-ghidra-get_xrefs_to(address="0x00477042", limit=50)
+2) user-ghidra-get_xrefs_to(address="0x0047700e", limit=50)
+3) user-ghidra-get_xrefs_to(address="0x00477026", limit=50)
+
+Raw data read:
+- xrefs to 0x00477042 ("Usage: %s <password>\n"):
+  * From 0x00401a3b in FUN_004019e1 [DATA]
+  * From 0x00401a45 in FUN_004019e1 [PARAM]
+- xrefs to 0x0047700e ("You achieved Level 6!"): none shown in returned output (empty tool output).
+- xrefs to 0x00477026 ("Sorry, not quite there yet."):
+  * From 0x00401a23 in FUN_004019e1 [DATA]
+  * From 0x00401a2a in FUN_004019e1 [PARAM]
+
+Interpretation:
+- Multiple key strings converge in FUN_004019e1, likely the main wrapper/control flow.
+
+Why this led to next step:
+- Decompile FUN_004019e1 to identify where password argument is passed and what function actually validates it.
+
+
+-----------------------------------------------------------------------
+Step 3 - Decompile wrapper function to identify validator
+-----------------------------------------------------------------------
+Tool used:
+1) user-ghidra-decompile_function_by_address(address="0x004019e1")
+
+Raw data read (verbatim decompile):
+int FUN_004019e1(int param_1,undefined8 *param_2)
+{
+  int local_c;
+  
+  if (param_1 == 2) {
+    local_c = FUN_00401892(param_2[1]);
+    if (local_c == 1) {
+      FUN_0040a850("You achieved Level 6!");
+    }
+    else {
+      FUN_0040a850("Sorry, not quite there yet.");
+    }
+  }
+  else {
+    FUN_00404ee0("Usage: %s <password>\n",*param_2);
+  }
+  return local_c;
+}
+
+Interpretation:
+- If argc==2, argv[1] is sent to FUN_00401892 (validator).
+- Return value 1 means success message.
+- This is definitively password-check orchestration.
+
+Why this led to next step:
+- Decompile FUN_00401892 fully; that is the core check.
+
+
+-----------------------------------------------------------------------
+Step 4 - Decompile the password validation function
+-----------------------------------------------------------------------
+Tool used:
+1) user-ghidra-decompile_function_by_address(address="0x00401892")
+
+Raw data read (important parts):
+- Local buffer setup with 43 bytes at locals local_48..local_1e:
+  CC D7 AD BA B1 84 4C 78 C4 8D 93 9C 80 8B 31 74
+  99 D9 B9 BA 89 DE 6E 54 F5 D5 FF AB DD 8D 5F 36
+  DE D4 9C AD DD 9B 5F 58 99 9A B1
+- Copies user input into local_78 using thunk_FUN_004178d0(local_78, param_1, 0x2b)
+- Registers and triggers signal 5 handler:
+  FUN_004043b0(5, FUN_00401725);
+  FUN_00404470(5);
+- Transforms local_78:
+  FUN_0040179d(local_78, 0x2b, 0xaabbccddeeff0011);
+- Compares transformed local_78 with hardcoded bytes:
+  iVar1 = thunk_FUN_00417860(local_78, &local_48, 0x2b);
+- Success only if:
+  (iVar1 == 0) && (DAT_004a40d0 == 0)
+
+Interpretation:
+- Expected value is not plaintext in binary; it is obfuscated by transform.
+- Input is transformed then compared to ciphertext bytes.
+- Constant key-like literal 0xAABBCCDDEEFF0011 is central.
+- Anti-debug/anti-tamper hint: SIGTRAP (signal 5) handler toggles a global; success requires global untouched.
+
+Why this led to next step:
+- Decompile helper functions called by validator to reconstruct exact transform and derive plaintext password.
+
+
+-----------------------------------------------------------------------
+Step 5 - Decompile helper functions used by validator
+-----------------------------------------------------------------------
+Tools used (parallel):
+1) user-ghidra-decompile_function_by_address("0x0040179d")
+2) user-ghidra-decompile_function_by_address("0x00401725")
+3) user-ghidra-decompile_function_by_address("0x00404470")
+4) user-ghidra-decompile_function_by_address("0x004043b0")
+5) user-ghidra-decompile_function_by_address("0x004178d0")
+6) user-ghidra-decompile_function_by_address("0x00417860")
+
+Raw data read and interpretation:
+
+A) FUN_00401725:
+void FUN_00401725(void)
+{
+  DAT_004a40d0 = 0;
+}
+- Handler sets global flag to 0.
+
+B) FUN_00404470:
+- Wraps libc raise-like functionality; on success returns non-error.
+- Called with 5 => signal 5 (SIGTRAP on Linux).
+
+C) FUN_004043b0:
+- Wraps sigaction/signal registration-like behavior, binding handler for signal 5.
+- Confirms anti-debug-adjacent control flow but not password derivation itself.
+
+D) FUN_0040179d (critical transform):
+for each 8-byte block:
+  local_28 = counter;
+  FUN_00401739(local_20, &local_28);
+  byte ^= corresponding byte of local_28
+with:
+  local_20 = bytes of 0xAABBCCDDEEFF0011 (big-endian extraction)
+  counter increments per block starting at 0
+
+E) FUN_00401739:
+builds 64-bit local_10 from 8 key bytes
+*param_2 = *param_2 XOR local_10
+- So local_28 becomes (counter XOR key64).
+
+F) thunk_FUN_004178d0 and thunk_FUN_00417860:
+- Chosen optimized libc routine dispatchers (cpu feature-based) for copy and compare.
+- Semantics map to memcpy/memcmp-like behavior.
+
+Why this led to next step:
+- With transform mathematically understood as:
+  transformed_input[i] = input[i] XOR byte((key64 XOR block_counter), i_mod_8)
+  and transformed_input compared to fixed ciphertext,
+  the original password is:
+  input = ciphertext XOR keystream
+- Next step: compute this exactly.
+
+
+-----------------------------------------------------------------------
+Step 6 - Reconstruct password by reversing transform
+-----------------------------------------------------------------------
+Tool used:
+1) Shell: Python script to decode ciphertext with keystream
+
+Raw command executed:
+python3 - <<'PY'
+enc = [0xcc,0xd7,0xad,0xba,0xb1,0x84,0x4c,0x78,0xc4,0x8d,0x93,0x9c,0x80,0x8b,0x31,0x74,0x99,0xd9,0xb9,0xba,0x89,0xde,0x6e,0x54,0xf5,0xd5,0xff,0xab,0xdd,0x8d,0x5f,0x36,0xde,0xd4,0x9c,0xad,0xdd,0x9b,0x5f,0x58,0x99,0x9a,0xb1]
+key = 0xaabbccddeeff0011
+out=[]
+for i,b in enumerate(enc):
+    ctr=i//8
+    ks=(key ^ ctr)
+    shift=(7-(i%8))*8
+    kbyte=(ks>>shift)&0xff
+    out.append(b ^ kbyte)
+print(bytes(out))
+print(bytes(out).decode('latin1'))
+PY
+
+Raw output read:
+b'flag_{Lin6_Ant1d3bugg!nG_n3v3r_$toPp3d_M3!}'
+flag_{Lin6_Ant1d3bugg!nG_n3v3r_$toPp3d_M3!}
+
+Interpretation:
+- Derived plaintext is clean printable ASCII and CTF-style flag format, strongly confirming correctness.
+- Length is exactly 43 bytes (0x2b), matching check length in validator.
+
+Final recovered password:
+flag_{Lin6_Ant1d3bugg!nG_n3v3r_$toPp3d_M3!}
+
+
+========================================================================
+3) Complete Data Inventory I Read
+========================================================================
+- Entire output of list_strings(limit=2000), including:
+  * password usage/success/failure strings used for navigation
+  * large amount of glibc/runtime strings (noise)
+- xrefs to key strings (addresses and referring function offsets)
+- Full decompile of:
+  * 0x004019e1
+  * 0x00401892
+  * 0x0040179d
+  * 0x00401739
+  * 0x00401725
+  * 0x004043b0
+  * 0x00404470
+  * 0x004178d0
+  * 0x00417860
+- Function name search outputs for "pass" and "strcmp"
+- Import list output
+- Python decode script output
+
+
+========================================================================
+4) Why this method is reliable
+========================================================================
+- The execution path from argument handling to success/failure print is direct and explicit.
+- The password check uses deterministic transform + deterministic compare.
+- Reversal of XOR-based transform is exact and lossless.
+- Recovered text length and character profile match expected validation constraints.
+
+
+========================================================================
+5) Delivered Result
+========================================================================
+Recovered shutdown password:
+flag_{Lin6_Ant1d3bugg!nG_n3v3r_$toPp3d_M3!}
+

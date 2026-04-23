@@ -1,0 +1,398 @@
+Ransomware Shutdown Password Recovery Log
+Date: 2026-04-07
+Analyst: Cursor agent
+
+Objective
+- Identify the hardcoded password/check value used to trigger a malware shutdown path.
+
+Environment / Tools Used
+- Cutter MCP tools:
+  - list_functions
+  - list_imports
+  - list_exports
+  - list_libraries
+  - show_function_detail
+  - decompile_function_by_address
+  - disassemble_function
+  - xrefs_to
+- Local shell command (python3) to reproduce decrypt logic.
+
+==================================================
+Step 1: Initial triage of binary structure
+==================================================
+Action:
+- Called:
+  - list_functions(offset=0, limit=200)
+  - list_imports(offset=0, limit=200)
+  - list_exports(offset=0, limit=200)
+  - list_libraries(offset=0, limit=200)
+
+Raw data observed:
+- functions: large list of stripped symbols, e.g. fcn.00401000 ... fcn.00422820
+- imports: empty table header only
+- exports: empty table header only
+- libraries: empty
+
+Interpretation:
+- Binary appears statically linked and heavily stripped.
+- No symbol names or obvious imported strcmp/memcmp labels to guide direct string search.
+- Need control-flow-first analysis from entrypoint and nearby startup routines.
+
+Why this mattered:
+- Established that password hunt would rely on disassembly/decompilation logic instead of symbol-based reversing.
+
+==================================================
+Step 2: Entry point analysis
+==================================================
+Action:
+- Called for address 0x00401600:
+  - show_function_detail
+  - decompile_function_by_address
+  - disassemble_function
+
+Raw data observed:
+- Function name: entry0
+- Critical instruction: call fcn.004040e0
+- After call, hlt/infinite halt pattern.
+
+Interpretation:
+- Standard startup trampoline into main runtime/dispatcher.
+- entry0 itself does not contain password logic; must locate checker deeper in control flow.
+
+Why this mattered:
+- Confirmed where real execution begins and avoided wasting time on wrapper code.
+
+==================================================
+Step 3: Candidate checker function at 0x00401a09
+==================================================
+Action:
+- Called for 0x00401a09:
+  - show_function_detail
+  - decompile_function_by_address
+  - disassemble_function
+
+Raw data observed (key excerpts):
+- Function copies 47 bytes from input buffer:
+  - data copied from arg1 into local var_78h..var_51h
+- Hardcoded 47-byte array initialized on stack:
+  - 5e de b9 d4 d8 8a b2 ca 97 20 98 a3 cb b2 ab d6
+    56 b9 b7 95 c4 33 91 1b 54 60 9e 69 b3 75 5c da
+    05 16 00 5a 67 b3 3f 41 6c 3f 3c 64 a4 3d cd
+- Call sequence:
+  - fcn.00401725(&input_copy, 0x2f, 0x5f5d6e4c3b2a1d0e)
+  - fcn.00401070(&input_copy, &hardcoded_array, 0x2f)
+- Return condition:
+  - returns true when fcn.00401070 result == 0
+
+Interpretation:
+- 0x2f decimal = 47 bytes (password length).
+- Input is transformed in-place by fcn.00401725 using 8-byte key 0x5f5d6e4c3b2a1d0e.
+- Then transformed input is compared to hardcoded target bytes.
+- Therefore cleartext password is recoverable by reversing that transform against embedded bytes.
+
+Why this mattered:
+- This is the concrete verification routine; once identified, password extraction becomes deterministic.
+
+==================================================
+Step 4: Validate compare primitive and transform primitive
+==================================================
+Action:
+- Called:
+  - xrefs_to(0x00401a09)
+  - decompile/disassemble for 0x00401725
+  - decompile/disassemble for 0x00401070
+
+Raw data observed:
+- xrefs showed call at 0x401b69 to fcn.00401a09 (confirms active check path).
+- fcn.00401070:
+  - indirect jump via ifunc pointer (likely memcmp-equivalent resolver)
+- fcn.00401725:
+  - Builds 256-byte S-box with 0..255
+  - KSA loop mixing key bytes (key index i % 8)
+  - PRGA loop generating keystream bytes
+  - XORs keystream with input buffer in place
+
+Interpretation:
+- fcn.00401725 is RC4 implementation (KSA + PRGA + XOR).
+- Since RC4 is symmetric, decryption uses same algorithm with same key.
+- So target bytes can be decrypted directly to plaintext password.
+
+Why this mattered:
+- Confirmed exact cryptographic routine (not a custom one-way hash), enabling direct recovery.
+
+==================================================
+Step 5: Recover plaintext password
+==================================================
+Action:
+- Ran local python3 script that:
+  - Uses key bytes from 0x5f5d6e4c3b2a1d0e (little-endian byte order used in algorithm as laid out in memory):
+    0e 1d 2a 3b 4c 6e 5d 5f
+  - Runs RC4 KSA/PRGA
+  - XOR-decrypts the 47-byte embedded ciphertext array
+
+Raw command output:
+- len 47
+- hex:
+  666c61675f7b4c696e355f5034746368216e675f42316e40722133245f69535f415f35757033725f5030773372217d
+- repr:
+  'flag_{Lin5_P4tch!ng_B1n@r!3$_iS_A_5up3r_P0w3r!}'
+- ascii-safe:
+  flag_{Lin5_P4tch!ng_B1n@r!3$_iS_A_5up3r_P0w3r!}
+
+Interpretation:
+- Plaintext is fully printable and CTF-like, strongly indicating correctness.
+- Length matches comparator length (47), further validating result.
+
+Recovered shutdown password:
+- flag_{Lin5_P4tch!ng_B1n@r!3$_iS_A_5up3r_P0w3r!}
+
+==================================================
+Final reasoning chain (concise)
+==================================================
+1) Found stripped/static binary -> use control flow, not symbols.
+2) Located verifier at 0x00401a09 with fixed 47-byte target.
+3) Identified pre-compare transform function 0x00401725 as RC4 with key 0x5f5d6e4c3b2a1d0e.
+4) Decrypted embedded 47-byte target with same RC4 routine.
+5) Output plaintext string accepted as password.
+
+End of log.
+Ransomware Password Recovery - Full Method and Evidence Log
+Date: 2026-04-07
+Analyst: Cursor agent via Cutter MCP tools
+
+Scope
+- Objective: Identify the password/check string in a loaded ransomware sample, specifically a string likely used to shut down the malware.
+- Method: Static reverse engineering using Cutter MCP function listing, disassembly, decompilation, and offline decoding of obfuscated bytes.
+
+----------------------------------------------------------------------
+1) Initial Enumeration
+----------------------------------------------------------------------
+
+Step 1.1 - List imports
+Command/tool:
+- user-cutter-list_imports(offset=0, limit=200)
+
+Raw result:
+- "nth vaddr bind type lib name -----------------------------"
+- No useful import list was returned.
+
+Interpretation:
+- Either stripped/static-linked binary or tooling could not resolve imports in a standard way.
+- This means symbol-driven triage (e.g., looking for strcmp/recv/send imports) is not available.
+
+Why it mattered:
+- It forced a control-flow-first strategy: start at entry point and follow runtime init toward actual logic.
+
+Step 1.2 - List exports
+Command/tool:
+- user-cutter-list_exports(offset=0, limit=200)
+
+Raw result:
+- "nth paddr vaddr bind type size lib name ----------------------------------------"
+- No useful export names were returned.
+
+Interpretation:
+- Reinforces that symbol metadata is minimal/stripped.
+
+Why it mattered:
+- Confirms we should work from addresses/functions instead of names.
+
+Step 1.3 - List functions
+Command/tool:
+- user-cutter-list_functions(offset=0, limit=300)
+
+Raw result (high-level):
+- Large list of unnamed functions like:
+  - 0x00401600 entry0
+  - 0x004040e0 fcn.004040e0
+  - 0x00401a09 fcn.00401a09
+  - many others
+
+Interpretation:
+- The binary contains many internal functions and at least one true entry (`entry0` at 0x00401600).
+- Presence of many `fcn.*` and sparse symbols suggests stripped/static build.
+
+Why it mattered:
+- `entry0` gives a deterministic start point to follow execution.
+
+----------------------------------------------------------------------
+2) Runtime Startup Path Triage
+----------------------------------------------------------------------
+
+Step 2.1 - Inspect entry function
+Tools:
+- user-cutter-show_function_detail(address=0x00401600)
+- user-cutter-disassemble_function(address=0x00401600)
+- user-cutter-decompile_function_by_address(address=0x00401600)
+
+Key raw data:
+- entry0 size: 34 bytes
+- entry0 calls `fcn.004040e0` with first arg `0x401b3b` then halts loop.
+- Disassembly includes:
+  - mov rdi, data.00401b3b
+  - call fcn.004040e0
+
+Interpretation:
+- `entry0` is a thin bootstrap/trampoline to a runtime initializer (`fcn.004040e0`), likely CRT/static runtime setup.
+
+Why it mattered:
+- Next pivot target: `fcn.004040e0`.
+
+Step 2.2 - Inspect `fcn.004040e0`
+Tools:
+- user-cutter-show_function_detail(0x004040e0)
+- user-cutter-disassemble_function(0x004040e0)
+- user-cutter-decompile_function_by_address(0x004040e0)
+
+Key raw data:
+- Size: 471 bytes
+- Performs relocation/init-array handling
+- References strings/data typical of runtime, including:
+  - "Unexpected reloc type in static binary."
+- Calls many init/fini style functions and loops.
+
+Interpretation:
+- This is startup/runtime glue, not business logic for password checks.
+- Need to branch to candidate routines likely used by main logic, not runtime internals.
+
+Why it mattered:
+- Avoided wasting time in generic runtime and redirected hunt to targeted verifier-style routines.
+
+----------------------------------------------------------------------
+3) Locate Candidate Password Verifier
+----------------------------------------------------------------------
+
+Step 3.1 - Inspect function at 0x00401a09
+Tools:
+- user-cutter-show_function_detail(0x00401a09)
+- user-cutter-disassemble_function(0x00401a09)
+- user-cutter-decompile_function_by_address(0x00401a09)
+
+Raw structural findings:
+- Function returns boolean-like result (`return iVar1 == 0`)
+- Stack local bytes initialized with fixed 49-byte sequence.
+- Calls:
+  - fcn.00401030(&var_88h, &var_48h, 0x31)
+  - fcn.00401725(&var_88h, 0x31, 0x1d6796e070c749b7)
+  - fcn.00401070(&var_88h, arg1, 0x31)
+
+Critical embedded 49-byte blob (hex) built in stack locals:
+bf 2b 00 b8 51 2d 62 39 37 65 78 41 b4 7c 65 8c ed 26 42 07 05 7b 55 f3
+99 d6 2f 56 7b 80 46 40 e6 6f 97 17 38 ca 00 28 6c 95 7a a7 37 eb e6 9d 71
+
+Interpretation:
+- This is textbook verifier layout:
+  1) Copy blob
+  2) Transform/decrypt blob
+  3) Compare with user input for exact equality
+- Length `0x31` (49) strongly indicates fixed-length secret.
+- The constant `0x1d6796e070c749b7` looked like an encryption key material.
+
+Why it mattered:
+- This was the most direct path to recover the password without brute force.
+
+----------------------------------------------------------------------
+4) Confirm Transform Algorithm
+----------------------------------------------------------------------
+
+Step 4.1 - Decompile and disassemble `fcn.00401725`
+Tools:
+- user-cutter-decompile_function_by_address(0x00401725)
+- user-cutter-disassemble_function(0x00401725)
+
+Raw algorithmic evidence:
+- Initializes a 256-byte array with values 0..255
+- Runs key-scheduling loop over 256 entries using key bytes repeating modulo 8
+- Runs pseudo-random generation loop producing keystream bytes
+- XORs generated keystream with input buffer in-place
+
+Interpretation:
+- This is RC4-style KSA + PRGA stream cipher implementation.
+- Because it XORs in-place, same routine decrypts encrypted blob.
+
+Why it mattered:
+- Enables deterministic offline decryption:
+  plaintext = ciphertext XOR RC4_keystream
+
+Step 4.2 - Check comparator wrappers
+Tools:
+- user-cutter-decompile_function_by_address(0x00401030)
+- user-cutter-decompile_function_by_address(0x00401070)
+
+Raw data:
+- Both appeared as IFUNC wrapper calls (decompiler could not recover full jump tables):
+  - fcn.00401030 -> (*_ifunc_416c90)()
+  - fcn.00401070 -> (*_ifunc_416c20)()
+
+Interpretation:
+- These are likely optimized libc-style wrappers (e.g., memcpy/memcmp variants).
+- Context from caller arguments makes semantics clear:
+  - 00401030 used like a copy of 49 bytes.
+  - 00401070 used like compare(buffer, userInput, 49) == 0.
+
+Why it mattered:
+- Even without direct symbol names, call signatures and usage confirm verifier semantics.
+
+----------------------------------------------------------------------
+5) Recover Plaintext Secret
+----------------------------------------------------------------------
+
+Step 5.1 - Reproduce RC4 decode in Python
+Action:
+- Wrote a short Python script to:
+  - load ciphertext bytes (49 bytes),
+  - extract 8-byte key from constant `0x1d6796e070c749b7` in little-endian order,
+  - run RC4 KSA/PRGA,
+  - XOR keystream with ciphertext.
+
+Script output:
+- key bytes: b7 49 c7 70 e0 96 67 1d
+- plain hex:
+  666c61675f7b4c696e345f443362756767316e675f69535f4d7563485f6640357433725f466f725f746831245f4f6e3321
+- plain bytes:
+  b'flag_{Lin4_D3bugg1ng_iS_MucH_f@5t3r_For_th1$_On3!'
+- printable string:
+  flag_{Lin4_D3bugg1ng_iS_MucH_f@5t3r_For_th1$_On3!
+
+Interpretation:
+- This is a complete valid ASCII flag/password format string.
+- Because comparison length is exactly 49, this entire string is the required input.
+
+Why it mattered:
+- Directly yields candidate password with cryptographic certainty from binary logic.
+
+----------------------------------------------------------------------
+6) Final Answer and Confidence
+----------------------------------------------------------------------
+
+Recovered password:
+- flag_{Lin4_D3bugg1ng_iS_MucH_f@5t3r_For_th1$_On3!
+
+Confidence:
+- Very high (derived from static verifier routine, not guesswork).
+
+Potential caveat:
+- This is the exact verifier value found in function `fcn.00401a09`. If malware has multiple command channels or additional runtime gating, other credentials may exist elsewhere. But this one is definitely valid for this check path.
+
+----------------------------------------------------------------------
+7) Summary of Data Read
+----------------------------------------------------------------------
+
+Data sources queried:
+1) Imports table (empty/minimal)
+2) Exports table (empty/minimal)
+3) Function list (hundreds of unnamed addresses)
+4) entry0 detail/disasm/decompile at 0x00401600
+5) runtime init function detail/disasm/decompile at 0x004040e0
+6) verifier candidate detail/disasm/decompile at 0x00401a09
+7) transform routine decompile/disasm at 0x00401725
+8) IFUNC wrapper decompiles at 0x00401030 and 0x00401070
+9) offline Python decode outputs (key bytes, plaintext hex, plaintext string)
+
+Decision logic:
+- Missing symbols -> start at entry
+- Runtime-heavy startup -> pivot to likely verifier
+- Constant blob + transform + compare pattern -> decode transform
+- RC4 structure confirmed -> recover plaintext exactly
+
+End of log.

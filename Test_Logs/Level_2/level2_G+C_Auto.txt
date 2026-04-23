@@ -1,0 +1,193 @@
+Ransomware Password Recovery Worklog
+Date: 2026-04-08
+Analyst: Cursor coding agent (GPT-5.3)
+Scope: Recover shutdown/auth password from sample loaded in both Ghidra and Cutter.
+
+============================================================
+1) Objective and Method
+============================================================
+Goal:
+- Find the embedded password that triggers the malware's success path.
+
+Method:
+- Use both Ghidra and Cutter APIs in parallel to:
+  1) Enumerate strings and functions.
+  2) Identify password-check candidate routines.
+  3) Decompile candidate routine(s) in both tools.
+  4) Confirm call path from main() to the check routine.
+  5) Cross-validate final password.
+
+Why this method:
+- Strings reveal human-facing auth/usage text quickly.
+- Function list can expose named routines like check_password.
+- Cross-tool validation reduces decompiler/tool-specific interpretation errors.
+
+============================================================
+2) Exact Step-by-Step Actions, Raw Data, Interpretation
+============================================================
+
+Step 2.1 - Initial broad triage (parallel queries)
+Tools called:
+- Ghidra: list_strings(limit=2000)
+- Cutter: list_functions(offset=0, limit=300)
+- Ghidra: list_imports(limit=300)
+- Cutter: list_imports(limit=300)
+
+Raw data read (key outputs):
+
+A) Ghidra strings (notable entries used for analysis):
+- 0047700e: "@@You achieved Level 2!"
+- 00477026: "Sorry, not quite there yet."
+- 00477042: "Usage: %s <password>\n"
+...plus a very large number of glibc/runtime strings and symbols.
+
+Interpretation:
+- Presence of "Usage: %s <password>" strongly indicates command-line password check.
+- Success/failure status strings indicate a binary branch based on a validation function.
+
+B) Cutter function list (key entries):
+- 0x00401725 sym.check_password
+- 0x0040180a main
+...plus many libc/runtime functions.
+
+Interpretation:
+- A symbol explicitly named check_password is a prime candidate.
+- main is nearby in address space; likely calls check_password directly.
+
+C) Ghidra imports output:
+- (empty / no relevant import list returned in this response)
+
+Interpretation:
+- No useful import signal from this call for password recovery.
+
+D) Cutter imports output:
+- "nth vaddr bind type lib name -----------------------------"
+
+Interpretation:
+- No immediate value for this task from imports.
+
+
+Step 2.2 - Targeted decompilation of candidate and caller (parallel)
+Tools called:
+- Ghidra: decompile_function_by_address(0x00401725)   // check_password
+- Cutter: decompile_function_by_address(0x00401725)   // check_password
+- Ghidra: decompile_function_by_address(0x0040180a)   // main
+- Cutter: decompile_function_by_address(0x0040180a)   // main
+
+Raw data read:
+
+A) Ghidra decompile @ 0x00401725:
+------------------------------------------------------------
+bool check_password(char *param_1)
+{
+  int iVar1;
+  char local_38 [48];
+  
+  builtin_strncpy(local_38,"flag_{Lin2_WhY_1S_th!$_sTr1n9_h@rD3r_T0_fiNd?}",0x2f);
+  iVar1 = strcmp(param_1,local_38);
+  return iVar1 == 0;
+}
+------------------------------------------------------------
+
+Interpretation:
+- Password literal is directly embedded as:
+  flag_{Lin2_WhY_1S_th!$_sTr1n9_h@rD3r_T0_fiNd?}
+- Logic is exact string equality via strcmp.
+
+
+B) Cutter decompile @ 0x00401725:
+- Reconstructed string byte-by-byte in local stack variables.
+- Final compare performed by call to fcn.00401098(arg1, &var_38h) (strcmp equivalent).
+- Reconstructed bytes decode to:
+  "flag_{Lin2_WhY_1S_th!$_sTr1n9_h@rD3r_T0_fiNd?}"
+
+Interpretation:
+- Confirms Ghidra result independently.
+- Byte-wise construction likely intended to reduce trivial string visibility in some contexts.
+
+
+C) Ghidra decompile @ 0x0040180a (main):
+------------------------------------------------------------
+undefined4 main(int param_1,undefined8 *param_2)
+{
+  int iVar1;
+  undefined4 local_c;
+  
+  if (param_1 == 2) {
+    iVar1 = check_password(param_2[1]);
+    if (iVar1 == 0) {
+      puts("Sorry, not quite there yet.");
+    }
+    else {
+      puts("You achieved Level 2!");
+    }
+  }
+  else {
+    printf("Usage: %s <password>\n",*param_2);
+  }
+  return local_c;
+}
+------------------------------------------------------------
+
+Interpretation:
+- argv[1] is passed into check_password.
+- Match => success string; mismatch => failure string.
+- This confirms operational role of extracted password.
+
+
+D) Cutter decompile @ 0x0040180a (main):
+- Shows argc check for 2 arguments.
+- Calls check_password(argv[1]).
+- On failure prints "Sorry, not quite there yet."
+- On success prints success string pointer.
+
+Interpretation:
+- Same control flow as Ghidra, confirming consistency.
+
+
+Step 2.3 - Xref and naming confirmation (parallel)
+Tools called:
+- Ghidra: get_xrefs_to(address=0x00401725, limit=20)
+- Cutter: xrefs_to(address=0x00401725)
+- Ghidra: search_functions_by_name(query="password", limit=20)
+- Cutter: search_functions_by_name(query="password", limit=20)
+
+Raw data read:
+
+A) Ghidra xrefs to 0x00401725:
+- From 0040182d in main [UNCONDITIONAL_CALL]
+- (also non-execution metadata references: entry/data)
+
+B) Cutter xrefs to 0x00401725:
+- main 0x40182d [CALL] call check_password
+
+C) Ghidra search by name:
+- check_password @ 00401725
+
+D) Cutter search by name:
+- 0x00401725 sym.check_password
+
+Interpretation:
+- Direct call site in main confirmed by both tools at the same location.
+- Symbol identity and call graph are consistent across tools.
+
+============================================================
+3) Final Result
+============================================================
+Recovered password:
+flag_{Lin2_WhY_1S_th!$_sTr1n9_h@rD3r_T0_fiNd?}
+
+Confidence:
+- High.
+
+Why confidence is high:
+- Literal recovered from Ghidra decompilation of check routine.
+- Independent Cutter decompilation reconstructs identical byte sequence.
+- main->check_password call path verified by xrefs in both tools.
+
+============================================================
+4) Notes on Data Volume
+============================================================
+One dataset (Ghidra list_strings) was very large and heavily populated with standard glibc/runtime strings.
+For forensic usefulness, the decisive strings and all decisive function/xref outputs were captured above verbatim.
+

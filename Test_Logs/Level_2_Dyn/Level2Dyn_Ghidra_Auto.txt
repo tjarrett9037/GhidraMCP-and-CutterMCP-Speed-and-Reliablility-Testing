@@ -1,0 +1,157 @@
+Ransomware Password Recovery Log (Ghidra MCP Session)
+Date: 2026-03-25
+Analyst: Cursor AI Agent
+Objective: Identify any hardcoded "shutdown"/control password in the loaded sample.
+
+================================================================
+1) Investigation strategy
+================================================================
+I used a static reverse-engineering workflow:
+
+1. Enumerate strings for obvious candidate secrets and user-facing output.
+2. Enumerate imports to identify comparison/input-related APIs.
+3. Enumerate exports/symbols to locate likely logic functions (e.g., main/check_*).
+4. Decompile high-value functions and inspect control flow.
+5. Confirm exact literal used in password comparison.
+
+Reasoning:
+- Strings often expose passwords, flags, status messages, and usage hints.
+- Imports like strcmp indicate direct string comparison checks.
+- Exported/symbol names can reveal function intent quickly in non-stripped binaries.
+- Decompilation gives direct, high-confidence evidence of expected input.
+
+================================================================
+2) Raw data collected
+================================================================
+
+2.1 Tool call: list_strings(limit=2000)
+Observed key output (trimmed to relevant lines):
+
+00102004: "You achieved Level 2!"
+0010201a: "Sorry, not quite there yet."
+00102036: "Usage: %s <password>\n"
+001004de: "strcmp"
+.strtab::...: "main"
+.strtab::...: "check_password"
+
+Interpretation:
+- The binary expects a password argument from command line.
+- There is a success path and failure path clearly tied to password validation.
+- Presence of strcmp strongly suggests straightforward plaintext comparison.
+- Presence of symbol names "main" and "check_password" indicates likely non-stripped build and easy direct analysis.
+
+Why this mattered:
+- Immediately narrowed search to argument parsing + string comparison path.
+
+---------------------------------------------------------------
+2.2 Tool call: list_imports(limit=200)
+Observed:
+
+__libc_start_main
+puts
+printf
+strcmp
+__cxa_finalize
+_ITM_deregisterTMCloneTable
+_ITM_registerTMCloneTable
+__gmon_start__
+
+Interpretation:
+- Only simple libc calls are used.
+- strcmp import confirms a runtime string equality check likely gates behavior.
+
+Why this mattered:
+- Reinforced expectation that password may be a static literal rather than dynamically computed/decrypted.
+
+---------------------------------------------------------------
+2.3 Tool call: list_exports(limit=200)
+Observed key entries:
+
+check_password -> 00101159
+main -> 0010123e
+
+Interpretation:
+- Function names are intact and semantically meaningful.
+- check_password is the direct target for decompilation.
+
+Why this mattered:
+- Eliminated guesswork and reduced analysis time to the exact verification function.
+
+---------------------------------------------------------------
+2.4 Tool call: decompile_function(name="check_password")
+Observed decompiled code:
+
+bool check_password(char *param_1)
+{
+  int iVar1;
+  char local_38 [48];
+  
+  builtin_strncpy(local_38,"flag_{Lin2_WhY_1S_th!$_sTr1n9_h@rD3r_T0_fiNd?}",0x2f);
+  iVar1 = strcmp(param_1,local_38);
+  return iVar1 == 0;
+}
+
+Interpretation:
+- Hardcoded string copied into local buffer.
+- User-supplied input compared with strcmp.
+- Return true only on exact match.
+
+Why this mattered:
+- This is definitive proof of the expected password.
+
+---------------------------------------------------------------
+2.5 Tool call: decompile_function(name="main")
+Observed decompiled code:
+
+undefined4 main(int param_1,undefined8 *param_2)
+{
+  int iVar1;
+  undefined4 local_c;
+  
+  if (param_1 == 2) {
+    iVar1 = check_password(param_2[1]);
+    if (iVar1 == 0) {
+      puts("Sorry, not quite there yet.");
+    }
+    else {
+      puts("You achieved Level 2!");
+    }
+  }
+  else {
+    printf("Usage: %s <password>\n",*param_2);
+  }
+  return local_c;
+}
+
+Interpretation:
+- Program expects exactly one argument after executable name.
+- That argument is passed to check_password.
+- Success/failure messages align with string evidence.
+
+Why this mattered:
+- Validates end-to-end behavior and confirms no hidden second-stage check.
+
+================================================================
+3) Final recovered password
+================================================================
+
+flag_{Lin2_WhY_1S_th!$_sTr1n9_h@rD3r_T0_fiNd?}
+
+Confidence: High (directly hardcoded and compared with strcmp in check_password()).
+
+================================================================
+4) Repro steps someone else can run
+================================================================
+
+1. In Ghidra, list strings and find password-related text ("Usage: %s <password>").
+2. List exports/symbols and open check_password.
+3. Decompile check_password.
+4. Read the string literal copied into local buffer before strcmp.
+5. Use that exact literal as the password argument.
+
+================================================================
+5) Notes
+================================================================
+
+- This sample appears to be a challenge-style binary with a hardcoded "flag" password.
+- I did not observe cryptographic derivation or obfuscation in the analyzed path.

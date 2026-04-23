@@ -1,0 +1,195 @@
+Ransomware Shutdown Password Recovery Log
+Date: 2026-03-31
+Analyst: Cursor agent session
+
+Objective
+- Identify the password embedded in a ransomware sample loaded in Ghidra that can be used to shut down / stop malware behavior.
+
+Method Summary
+- Use Ghidra MCP tools to enumerate strings and symbols.
+- Locate likely password-validation code path.
+- Decompile relevant functions.
+- Reconstruct transform/check routine.
+- Recover plaintext password by reproducing algorithm externally.
+
+============================================================
+STEP-BY-STEP EXECUTION LOG
+============================================================
+
+Step 1: Initial hypothesis and search strategy
+What I did:
+- Started with string triage for words commonly associated with shutdown and credential checks.
+- Queried strings for the following filters: "pass", "shutdown", "stop", "kill".
+- Queried imports and exports to identify entrypoints and any obvious external crypto/API helpers.
+
+Why:
+- In many malware/CTF binaries, password prompts and usage strings leak the validation path.
+- "shutdown/kill/stop" often surfaces kill-switch messages or admin command handlers.
+
+------------------------------------------------------------
+Step 2: Data collected from string/import/export triage
+
+2.1 Query: list_strings(filter="pass")
+Returned data:
+- 00477042: "Usage: %s <password>\n"
+
+Interpretation:
+- This was the strongest indicator of a CLI argument check requiring a password.
+- Next action: trace cross-references to this exact string address.
+
+2.2 Query: list_strings(filter="shutdown")
+Returned data:
+- 0047a578: "tcache_thread_shutdown(): unaligned tcache chunk detected"
+- 0047b4d8: "Cannot send after transport endpoint shutdown"
+- 0047e245: "ESHUTDOWN"
+
+Interpretation:
+- These appear to be standard libc/system strings, not custom malware kill-switch prompts.
+- Not directly useful for finding the password check.
+
+2.3 Query: list_strings(filter="stop")
+Returned data:
+- (no relevant result in returned output)
+
+Interpretation:
+- No obvious custom stop command string found.
+
+2.4 Query: list_strings(filter="kill")
+Returned data:
+- 0047b530: "Operation not possible due to RF-kill"
+
+Interpretation:
+- Also looks like standard/system text; likely irrelevant.
+
+2.5 Query: list_imports(limit=200)
+Returned data:
+- (no entries shown in returned output snippet)
+
+Interpretation:
+- No immediate clue from imports in this specific response.
+
+2.6 Query: list_exports(limit=200)
+Returned data:
+- entry -> 00401600
+
+Interpretation:
+- Confirms binary entry symbol address but does not yet reveal password logic.
+
+------------------------------------------------------------
+Step 3: Trace references to the promising password string
+
+3.1 Query: get_xrefs_to(address="0x00477042")
+Returned data:
+- From 00401ba0 in FUN_00401b46 [DATA]
+- From 00401baa in FUN_00401b46 [PARAM]
+
+Interpretation:
+- Function FUN_00401b46 references the usage string directly.
+- This is likely the argument-processing function for password input.
+- Next action: decompile FUN_00401b46.
+
+------------------------------------------------------------
+Step 4: Decompile and interpret argument-check wrapper
+
+4.1 Query: decompile_function_by_address("0x00401b46")
+Returned decompiled code:
+
+int FUN_00401b46(int param_1,undefined8 *param_2)
+{
+  int local_c;
+  
+  if (param_1 == 2) {
+    local_c = FUN_00401a09(param_2[1]);
+    if (local_c == 1) {
+      FUN_0040a590("You achieved Level 5!");
+    }
+    else {
+      FUN_0040a590("Sorry, not quite there yet.");
+    }
+  }
+  else {
+    FUN_00404c20("Usage: %s <password>\n",*param_2);
+  }
+  return local_c;
+}
+
+Interpretation:
+- Expects exactly one argument after program name (argc == 2).
+- Calls FUN_00401a09 on argv[1], which is the user-supplied password.
+- Success path prints "You achieved Level 5!", failure prints "Sorry, not quite there yet."
+- Therefore FUN_00401a09 is the core password validator.
+- Next action: decompile FUN_00401a09.
+
+------------------------------------------------------------
+Step 5: Decompile and interpret password validator
+
+5.1 Query: decompile_function_by_address("0x00401a09")
+Returned key behavioral data:
+- A 47-byte constant is loaded into local bytes local_48 ... local_1a:
+  5e de b9 d4 d8 8a b2 ca 97 20 98 a3 cb b2 ab d6
+  56 b9 b7 95 c4 33 91 1b 54 60 9e 69 b3 75 5c da
+  05 16 00 5a 67 b3 3f 41 6c 3f 3c 64 a4 3d cd
+- Input bytes are copied into a local buffer (beginning at local_78), total length used: 0x2f (47 bytes).
+- Calls:
+  FUN_00401725(&local_78, 0x2f, 0x5f5d6e4c3b2a1d0e)
+- Then compares transformed input against constant bytes:
+  thunk_FUN_00416c20(&local_78, &local_48, 0x2f)
+- Returns true iff comparison == 0.
+
+Interpretation:
+- Validation logic is:
+  transform(user_input_47_bytes, key=0x5f5d6e4c3b2a1d0e) == embedded_47_byte_constant
+- Need to reverse/understand FUN_00401725 transform routine.
+
+------------------------------------------------------------
+Step 6: Decompile and classify the transform algorithm
+
+6.1 Query: decompile_function_by_address("0x00401725")
+Key algorithm observations from decompilation:
+- Initializes S-box array 0..255.
+- Performs key scheduling over 256 rounds using 8-byte key material.
+- Generates pseudo-random byte stream over requested length.
+- XORs generated keystream with input buffer in-place.
+
+Interpretation:
+- This is RC4-like KSA + PRGA behavior.
+- Because operation is XOR stream cipher, decrypt and encrypt are the same:
+  plaintext XOR keystream = ciphertext
+  ciphertext XOR keystream = plaintext
+- Therefore we can recover expected plaintext password by applying same keystream to embedded constant.
+
+------------------------------------------------------------
+Step 7: Reproduce algorithm and recover plaintext password
+
+7.1 External verification script run in Python
+Action:
+- Implemented RC4-like routine mirroring decompiled logic.
+- Parsed key from constant 0x5f5d6e4c3b2a1d0e as little-endian bytes.
+- Used embedded 47-byte constant as ciphertext.
+- XORed with generated keystream to recover plaintext.
+
+Script output:
+- key bytes: 0e1d2a3b4c6e5d5f
+- plaintext hex:
+  666c61675f7b4c696e355f5034746368216e675f42316e40722133245f69535f415f35757033725f5030773372217d
+- plaintext repr:
+  b'flag_{Lin5_P4tch!ng_B1n@r!3$_iS_A_5up3r_P0w3r!}'
+- utf8:
+  flag_{Lin5_P4tch!ng_B1n@r!3$_iS_A_5up3r_P0w3r!}
+
+Interpretation:
+- The exact password expected by validator is:
+  flag_{Lin5_P4tch!ng_B1n@r!3$_iS_A_5up3r_P0w3r!}
+
+============================================================
+FINAL RESULT
+============================================================
+
+Recovered shutdown/check password:
+flag_{Lin5_P4tch!ng_B1n@r!3$_iS_A_5up3r_P0w3r!}
+
+Confidence:
+- High. Password was recovered directly from the binary's own validation logic and cryptographic transform path.
+
+Notes on assumptions/limits:
+- The phrasing "shutdown malware password" was interpreted as the binary's special accepted password path. The discovered string is definitively the accepted input for the observed validator function.

@@ -1,0 +1,248 @@
+Reverse Engineering Log - Lin8_2026 (Cutter MCP)
+Date: 2026-04-08
+Analyst: Cursor agent
+Objective: Recover the shutdown/password string used by the sample.
+
+====================================================================
+1) Initial enumeration of loaded binary in Cutter
+====================================================================
+
+Action:
+- Queried functions/imports/exports/libraries via Cutter MCP:
+  - list_functions(offset=0, limit=200)
+  - list_imports(offset=0, limit=200)
+  - list_exports(offset=0, limit=200)
+  - list_libraries(offset=0, limit=200)
+
+Data observed:
+- Large function list with unnamed symbols (fcn.0040....), entry at 0x00401660.
+- imports: empty listing format ("nth vaddr bind type lib name ...") with no rows.
+- exports: empty listing format ("nth paddr vaddr bind type size lib name ...") with no rows.
+- libraries: empty.
+
+Interpretation:
+- This suggests a statically linked binary (no dynamic imports/exports of interest).
+- Symbol names are stripped.
+
+Why this mattered:
+- Established that behavior must be recovered from internal code paths and constants.
+
+====================================================================
+2) Entry-point and runtime chain identification
+====================================================================
+
+Action:
+- Inspected entrypoint:
+  - show_function_detail(0x00401660)
+  - decompile_function_by_address(0x00401660)
+  - disassemble_function(0x00401660)
+
+Data observed:
+- entry0 at 0x00401660, tiny stub.
+- Calls fcn.00404c90 then halts/infinite behavior from decompiler perspective.
+
+Interpretation:
+- Startup trampoline; likely language runtime bootstrap.
+
+Action:
+- Inspected startup callee:
+  - decompile/show details of 0x00404c90
+  - search_functions_by_name("main")
+
+Data observed:
+- 0x00404c90 performs broad runtime initialization and calls many setup functions.
+- search_functions_by_name("main") returned none.
+
+Interpretation:
+- Likely Go binary with stripped names; true app logic must be found by string/xref and control-flow rather than symbol names.
+
+Why this mattered:
+- Prevented spending time on runtime-only routines and prompted pivot to string-guided hunting.
+
+====================================================================
+3) Header/segment verification and binary provenance
+====================================================================
+
+Action:
+- show_headers(offset=0, limit=200)
+- list_segments(offset=0, limit=50)
+
+Data observed:
+- file: /home/kali/Documents/MCPTesting/Test_Files/Working_files/CutterMCP_Solves/Lin8_2026
+- ELF64, static=true, stripped=true, PIE=false, NX=true.
+- Entry point 0x00401660.
+- .rodata at vaddr 0x00478000, size 0x1bbcc.
+
+Interpretation:
+- Confirms static stripped ELF where constants in .rodata are key.
+- Knowing rodata base allowed mapping string file offsets to virtual addresses.
+
+====================================================================
+4) String extraction to locate password-related anchors
+====================================================================
+
+Action:
+- Ran strings on target file and filtered for relevant terms via Python.
+
+Data observed (keyword filter hits):
+- "Usage: %s <password>"
+- "*** %s ***: terminated"
+- "Required key not available"
+- "Key has expired"
+- "Key has been revoked"
+- "Key was rejected by service"
+- plus libc/error noise.
+
+Interpretation:
+- "Usage: %s <password>" is a high-confidence anchor for command-line password check path.
+
+Action:
+- Printed surrounding strings context around "Usage: %s <password>" and "*** %s ***: terminated".
+
+Data observed (near password usage):
+- "/proc/%s/comm"
+- "You achieved Level 8!"
+- "Sorry, not quite there yet."
+- "Usage: %s <password>"
+
+Interpretation:
+- Presence of challenge success/failure messages near usage text strongly indicates this region contains the actual verification logic.
+
+Action:
+- Requested string offsets (`strings -a -t x`) for key lines.
+
+Data observed:
+- 0x78026: "/proc/%s/comm"
+- 0x78036: "You achieved Level 8!"
+- 0x7804c: "Sorry, not quite there yet."
+- 0x78068: "Usage: %s <password>"
+
+Interpretation:
+- With .rodata vaddr 0x00478000, computed addresses:
+  - 0x00478026, 0x00478036, 0x0047804c, 0x00478068
+
+Why this mattered:
+- Allowed direct xref lookup from these precise addresses to code locations.
+
+====================================================================
+5) Xref-driven pivot to the validation routine
+====================================================================
+
+Action:
+- xrefs_to on string virtual addresses.
+
+Data observed:
+- xrefs_to(0x00478068): (nofunc) 0x40274e [DATA] lea rdx, str.Usage:__s__password
+- xrefs_to(0x0047804c): (nofunc) 0x402736 [DATA] lea rax, str.Sorry__not_quite_there_yet.
+- xrefs_to(0x00478036): (nofunc) 0x402725 [DATA] lea rax, str.You_achieved_Level_8
+- xrefs_to(0x00478026): fcn.00401c2e 0x402193 [DATA] lea rdx, str.proc__s_comm
+
+Interpretation:
+- The 0x4027xx code area is where success/failure/usage strings are assembled.
+- Nearby function in same region likely performs password check.
+
+Action:
+- Decompile/disassemble function at 0x004024b8 (near discovered call flow).
+
+Data observed (critical):
+- Function initializes a 53-byte byte array on stack (bytes listed explicitly in disassembly).
+- Calls:
+  - fcn.00402464 and fcn.00401c2e (anti-debug/environment checks)
+  - fcn.00401a89(&user_input_copy, 0x35, 0x9988776655443322)
+  - fcn.00401070(&transformed_input, &hardcoded_bytes, 0x35)
+- Returns true iff memcmp result is zero.
+
+Interpretation:
+- This is the core password validation function.
+- Input length fixed at 0x35 (53) bytes.
+- Workflow:
+  1) Copy candidate input.
+  2) Transform input with stream cipher-like function using key 0x9988776655443322.
+  3) Compare transformed input against hardcoded 53-byte ciphertext.
+  4) Equality means correct password.
+
+Why this mattered:
+- The password is recoverable by reversing this transformation.
+
+====================================================================
+6) Cipher identification and reconstruction
+====================================================================
+
+Action:
+- Decompiled and disassembled fcn.00401a89.
+- Decompiled fcn.00401799 (called inside fcn.00401a89).
+
+Data observed in 0x00401a89:
+- Constructs constants from "expand 8-byte k" pattern (confirmed via rodata string seen earlier and state assembly).
+- Uses 8-byte key derived from 0x9988776655443322 (big-endian byte unpack loop).
+- Generates 64-byte keystream blocks via fcn.00401799.
+- XORs keystream with input bytes in 64-byte chunks.
+
+Data observed in 0x00401799:
+- 10-round double-round style quarter-round operations matching Salsa20 core structure.
+- Final add original state step and output 16 words (64 bytes).
+
+Interpretation:
+- The transform is Salsa20-like stream encryption with:
+  - sigma/constant corresponding to "expand 8-byte k"
+  - repeated 64-bit key in state (k0, k1, k0, k1)
+  - zero nonce/counter context in this challenge path
+- Since compare is against ciphertext, original password = ciphertext XOR keystream.
+
+Why this mattered:
+- Enabled deterministic offline decryption of hardcoded bytes.
+
+====================================================================
+7) Exact ciphertext bytes extracted from validation function
+====================================================================
+
+From fcn.004024b8 stack constants (53 bytes total):
+
+c2 d4 e1 49 bd 6f b4 61 93 3f 77 26 b1 ff 4f e1
+9f 50 03 43 8a c8 65 95 71 1f 9e a5 ab 4e a4 23
+45 08 61 11 64 c8 ff 41 66 bb fa 40 2c 56 b8 ce
+61 be 96 0d 35
+
+Interpretation:
+- This is the expected transformed value for correct input length 53.
+
+====================================================================
+8) Offline reproduction and decryption
+====================================================================
+
+Action:
+- Wrote Python script to:
+  1) Implement Salsa20 block (20 rounds / 10 double-rounds).
+  2) Build initial 16-word state consistent with fcn.00401a89:
+     - constants include 0x61707865, 0x3820646e, 0x7479622d, 0x006b2065
+     - key words from 0x9988776655443322 interpreted as:
+       k0 = 0x66778899
+       k1 = 0x22334455
+       and repeated in 8-byte-key layout.
+  3) Generate keystream block.
+  4) XOR first 53 bytes with ciphertext list above.
+
+Data observed (script output):
+- plaintext bytes:
+  b'flag_{Lin8_C@n_y0u_M4k3_a_b1n@ry_Pr!nt_!t$_0wn_Fl4g?}'
+- ascii:
+  flag_{Lin8_C@n_y0u_M4k3_a_b1n@ry_Pr!nt_!t$_0wn_Fl4g?}
+- printable check: True
+
+Interpretation:
+- This recovered plaintext is the required password accepted by check routine.
+
+====================================================================
+9) Final answer provided to user
+====================================================================
+
+Recovered password:
+flag_{Lin8_C@n_y0u_M4k3_a_b1n@ry_Pr!nt_!t$_0wn_Fl4g?}
+
+Confidence:
+- High. The value is mathematically derived from the exact compare path and constants used by the binary.
+
+Notes:
+- Some earlier inspected functions (e.g., runtime init/cpuid/memset/wcrtomb-like routines) were identified as non-target support code and deprioritized.
+- The decisive chain was: password usage string -> xref neighborhood -> validation function -> cipher routine -> reverse transform.
+

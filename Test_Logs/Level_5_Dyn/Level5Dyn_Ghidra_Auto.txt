@@ -1,0 +1,203 @@
+Ransomware Password Recovery Log
+Date: 2026-03-31
+Analyst: Cursor agent session
+Environment: Ghidra MCP tools + local Python verification
+
+================================================================
+Objective
+================================================================
+Find the password that triggers the malware shutdown / success path,
+using static reverse engineering in Ghidra.
+
+Note:
+- The analyzed sample appears to be a small challenge-style ELF binary.
+- Despite this, the same reverse-engineering workflow applies: find
+  input-validation logic, reconstruct transform, recover required input.
+
+================================================================
+Step-by-step Procedure with Raw Data and Interpretation
+================================================================
+
+STEP 1) Initial string/symbol triage
+Why:
+- Quickly identify candidate user-facing messages and imported APIs that
+  reveal input-check behavior (e.g., memcmp/strcmp/crypto routines).
+
+Tool calls made:
+1. user-ghidra-list_strings(limit=2000)
+2. user-ghidra-list_imports(limit=200)
+3. user-ghidra-list_exports(limit=200)
+
+Raw data read (key items):
+From list_strings:
+- 00102004: "You achieved Level 5!"
+- 0010201a: "Sorry, not quite there yet."
+- 00102036: "Usage: %s <password>\n"
+- 001004d7: "memcmp"
+- Other standard ELF/libc strings and section names
+
+From list_imports:
+- __libc_start_main
+- puts
+- printf
+- memcmp
+- __cxa_finalize
+- _ITM_deregisterTMCloneTable
+- _ITM_registerTMCloneTable
+- __gmon_start__
+
+From list_exports:
+- entry at 00101070
+- _DT_INIT / __DT_INIT / _DT_FINI / __DT_FINI and startup helpers
+
+Interpretation:
+- Presence of "Usage: %s <password>" strongly indicates argv-based password check.
+- Presence of memcmp strongly suggests byte-level comparison against a
+  computed or hardcoded buffer.
+- "You achieved Level 5!" and failure text define success/failure branches.
+
+
+STEP 2) Locate check function and call graph anchors
+Why:
+- Identify where memcmp is called and find main-like routine handling argv.
+
+Tool calls made:
+1. user-ghidra-list_functions()
+2. user-ghidra-search_functions_by_name(query="main", limit=20)
+3. user-ghidra-get_function_xrefs(name="memcmp", limit=50)
+
+Raw data read:
+From list_functions (relevant subset):
+- FUN_00101159 at 00101159
+- FUN_0010143d at 0010143d
+- FUN_0010157a at 0010157a
+- entry at 00101070
+
+From search_functions_by_name("main"):
+- __libc_start_main @ 00105000
+
+From get_function_xrefs("memcmp"):
+- From 00101567 in FUN_0010143d [UNCONDITIONAL_CALL]
+
+Interpretation:
+- There is no user-named main symbol, but FUN_0010157a is likely logical
+  main wrapper (confirmed in next step).
+- memcmp call site in FUN_0010143d marks the core validator function.
+
+
+STEP 3) Decompile core validation and transform routine
+Why:
+- Recover exact algorithm: how user input is transformed and compared.
+
+Tool calls made:
+1. user-ghidra-decompile_function_by_address("0x0010143d")
+2. user-ghidra-decompile_function_by_address("0x00101159")
+3. user-ghidra-disassemble_function("0x0010143d")
+
+Raw data read:
+A) Decompile of FUN_0010143d:
+- Loads 47 hardcoded bytes into locals (starts with 0x5e, 0xde, 0xb9, ...,
+  ends ... 0xa4, 0x3d, 0xcd).
+- Copies user input bytes into local buffer.
+- Calls FUN_00101159(&local_input, 0x2f, 0x5f5d6e4c3b2a1d0e).
+- Calls memcmp(&transformed_input, &hardcoded_bytes, 0x2f).
+- Returns true if memcmp == 0.
+
+B) Decompile of FUN_00101159:
+- Initializes state array 0..255.
+- Performs key-scheduling-like loop with 8-byte key material.
+- Generates keystream bytes for param_2 length.
+- XORs keystream with input buffer in place.
+
+C) Disassembly of FUN_0010143d:
+- Confirms exact 47-byte target constants written byte-by-byte.
+- Confirms call arguments:
+  - length = 0x2f (47 bytes)
+  - key immediate = 0x5f5d6e4c3b2a1d0e
+  - memcmp length = 0x2f
+
+Interpretation:
+- Validation equation is:
+  transform(user_input, key) == target_bytes
+- Since transform is stream XOR, inverse is direct:
+  user_input = target_bytes XOR keystream(key)
+- This is RC4-style KSA/PRGA behavior.
+
+
+STEP 4) Confirm front-end argument handling (main-like function)
+Why:
+- Verify expected input source and control-flow messaging.
+
+Tool call made:
+1. user-ghidra-decompile_function_by_address("0x0010157a")
+
+Raw data read:
+- If argc == 2:
+  - local_c = FUN_0010143d(argv[1]);
+  - if true -> puts("You achieved Level 5!")
+  - else -> puts("Sorry, not quite there yet.")
+- Else:
+  - printf("Usage: %s <password>\n", argv[0])
+
+Interpretation:
+- Password is exactly argv[1].
+- Required length effectively 47 bytes due to compare length 0x2f.
+
+
+STEP 5) Reconstruct password by reversing transform
+Why:
+- Produce exact plaintext required to pass check.
+
+Method:
+- Wrote local Python snippet implementing same RC4-like logic:
+  - key bytes from 0x5f5d6e4c3b2a1d0e (little-endian as bytes in code path used)
+  - target byte array copied from decompilation/disassembly
+  - generate keystream length 47
+  - plaintext = target XOR keystream
+
+Command output read:
+- len 47
+- bytes b'flag_{Lin5_P4tch!ng_B1n@r!3$_iS_A_5up3r_P0w3r!}'
+- ascii flag_{Lin5_P4tch!ng_B1n@r!3$_iS_A_5up3r_P0w3r!}
+- repr 'flag_{Lin5_P4tch!ng_B1n@r!3$_iS_A_5up3r_P0w3r!}'
+- hex 666c61675f7b4c696e355f5034746368216e675f42316e40722133245f69535f415f35757033725f5030773372217d
+
+Interpretation:
+- Final recovered password is:
+  flag_{Lin5_P4tch!ng_B1n@r!3$_iS_A_5up3r_P0w3r!}
+
+================================================================
+Result
+================================================================
+Recovered password:
+flag_{Lin5_P4tch!ng_B1n@r!3$_iS_A_5up3r_P0w3r!}
+
+Confidence: High
+Rationale:
+- Derived directly from static control flow and exact comparison bytes.
+- Algorithm behavior confirmed by decompiled code and disassembly.
+- Inversion mathematically deterministic for stream-XOR transform.
+
+================================================================
+What data was read (consolidated inventory)
+================================================================
+1) Strings table (full top slice, 2000 cap) with notable literals:
+   - success/failure/usage messages, memcmp symbol, libc symbols.
+2) Import table:
+   - puts, printf, memcmp, __libc_start_main, etc.
+3) Export table:
+   - entry/init/fini symbols.
+4) Full function list:
+   - identified key routines FUN_00101159, FUN_0010143d, FUN_0010157a.
+5) Xrefs to memcmp:
+   - pinpointed validation call in FUN_0010143d.
+6) Decompiled pseudocode:
+   - FUN_0010143d (validator + target blob + memcmp).
+   - FUN_00101159 (RC4-like transform).
+   - FUN_0010157a (argc/argv and message flow).
+7) Disassembly of FUN_0010143d:
+   - exact byte constants and immediate key/length confirmation.
+8) Local Python verification output:
+   - recovered plaintext and encoding checks.
+
+End of log.

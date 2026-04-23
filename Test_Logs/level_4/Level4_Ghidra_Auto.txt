@@ -1,0 +1,232 @@
+Title: Level 4 Password Recovery - Full MCP/Ghidra Work Log
+Date: 2026-03-31
+Analyst: Cursor Agent (MCP-assisted)
+
+Objective
+- Find the embedded password in a ransomware challenge binary loaded in Ghidra.
+- Provide exact extraction path from static analysis.
+
+Scope Note
+- This document captures every concrete action I took, the data I retrieved, how I interpreted it, and why I took each next step.
+- One early query (`list_strings`) returned a very large set of strings from the binary. I reviewed that output and used only the relevant string entries shown below for the password path. The output itself was very large and mostly glibc/runtime noise.
+
+============================================================
+STEP-BY-STEP EXECUTION LOG
+============================================================
+
+Step 1) Enumerate high-signal artifacts quickly (strings/imports/exports)
+Reason:
+- Password checks in CTF/ransomware challenge binaries are often surfaced by usage/help strings, success/fail messages, and exported entry points.
+
+Tool calls:
+1. user-ghidra-list_strings(limit=2000)
+2. user-ghidra-list_imports(limit=300)
+3. user-ghidra-list_exports(limit=200)
+
+Raw data read:
+
+[1A] Selected relevant strings from `list_strings` output:
+- 0047700e: "@@You achieved Level 4!"
+- 00477026: "Sorry, not quite there yet."
+- 00477042: "Usage: %s <password>\n"
+
+Additional observation from same output:
+- The majority of strings were glibc/runtime loader/internal assertions, not obvious challenge logic.
+
+[1B] `list_imports` result:
+- (no meaningful symbols returned in response)
+
+[1C] `list_exports` result:
+- entry -> 00401600
+
+Interpretation:
+- The usage string explicitly indicates the program expects a password argument.
+- Success/failure strings suggest a boolean password-validation branch.
+- Next move: find xrefs to these strings to locate the validation handler.
+
+------------------------------------------------------------
+
+Step 2) Follow cross-references to success/fail/usage strings
+Reason:
+- Xrefs reveal exact function(s) that print these messages and therefore likely contain the compare logic.
+
+Tool calls:
+1. user-ghidra-get_xrefs_to(address=0x00477042, limit=20)
+2. user-ghidra-get_xrefs_to(address=0x0047700e, limit=20)
+3. user-ghidra-get_xrefs_to(address=0x00477026, limit=20)
+
+Raw data read:
+
+[2A] Xrefs to `Usage: %s <password>\n` @ 0x00477042:
+- From 00401b95 in FUN_00401b3b [DATA]
+- From 00401b9f in FUN_00401b3b [PARAM]
+
+[2B] Xrefs to `Sorry, not quite there yet.` @ 0x00477026:
+- From 00401b7d in FUN_00401b3b [DATA]
+- From 00401b84 in FUN_00401b3b [PARAM]
+
+[2C] Xrefs to `@@You achieved Level 4!` @ 0x0047700e:
+- (no additional xref entries returned in the response; still clearly in same nearby message set)
+
+Interpretation:
+- `FUN_00401b3b` is the dispatch function controlling argument parsing + success/failure display.
+- Next move: decompile `FUN_00401b3b`.
+
+------------------------------------------------------------
+
+Step 3) Decompile the message-dispatch function
+Reason:
+- Need to identify the specific function doing password verification.
+
+Tool call:
+- user-ghidra-decompile_function_by_address(address=0x00401b3b)
+
+Raw data read (verbatim decompilation):
+
+int FUN_00401b3b(int param_1,undefined8 *param_2)
+
+{
+  int local_c;
+  
+  if (param_1 == 2) {
+    local_c = FUN_00401a09(param_2[1]);
+    if (local_c == 1) {
+      FUN_0040a590("You achieved Level 4!");
+    }
+    else {
+      FUN_0040a590("Sorry, not quite there yet.");
+    }
+  }
+  else {
+    FUN_00404c20("Usage: %s <password>\n",*param_2);
+  }
+  return local_c;
+}
+
+Interpretation:
+- If exactly 1 argument is passed (argc == 2), the input (`argv[1]`) is checked by `FUN_00401a09`.
+- `FUN_00401a09` is the validator. Must decompile next.
+
+------------------------------------------------------------
+
+Step 4) Decompile the validator function
+Reason:
+- Extract how input is transformed/compared; identify any encoded embedded secret.
+
+Tool call:
+- user-ghidra-decompile_function_by_address(address=0x00401a09)
+
+Raw data read (key decompilation details):
+- Function initializes 49 local bytes (`local_48`..`local_17`) with fixed constants:
+  bf 2b 00 b8 51 2d 62 39 37 65 78 41 b4 7c 65 8c
+  ed 26 42 07 05 7b 55 f3 99 d6 2f 56 7b 80 46 40
+  e6 6f 97 17 38 ca 00 28 6c 95 7a a7 37 eb e6 9d 71
+- Then executes:
+  - thunk_FUN_00416c90(local_88,&local_48,0x31);   // copy 49 bytes
+  - FUN_00401725(local_88,0x31,0x1d6796e070c749b7); // transform/decrypt in place
+  - iVar1 = thunk_FUN_00416c20(local_88,param_1,0x31); // compare 49 bytes with user input
+  - return iVar1 == 0;
+
+Interpretation:
+- This is a classic pattern: encrypted embedded blob -> decrypt -> compare with user input.
+- Need to understand `FUN_00401725` algorithm to reconstruct plaintext/password.
+
+------------------------------------------------------------
+
+Step 5) Decompile transform routine `FUN_00401725`
+Reason:
+- Identify exact cipher/PRNG so plaintext can be recovered.
+
+Tool call:
+- user-ghidra-decompile_function_by_address(address=0x00401725)
+
+Raw data read (algorithm summary from decompilation):
+- Initializes S-box with 0..255.
+- Performs KSA-like loop with 8-byte key material (derived from qword parameter).
+- Performs PRGA-like loop producing keystream bytes.
+- XORs keystream with input buffer in place.
+
+Interpretation:
+- This is RC4-style encryption/decryption.
+- Because RC4 is symmetric, running the routine over the embedded ciphertext with same key yields plaintext password bytes.
+
+------------------------------------------------------------
+
+Step 6) Validate what compare thunk is and avoid false assumption
+Reason:
+- Confirm comparison function is memcmp-like and not unusual.
+
+Tool calls:
+1. user-ghidra-search_functions_by_name(query="memcmp", limit=20)
+2. user-ghidra-search_functions_by_name(query="strncmp", limit=20)
+3. user-ghidra-search_functions_by_name(query="strcmp", limit=20)
+4. user-ghidra-get_function_by_address(address=0x00416c20)
+5. user-ghidra-decompile_function_by_address(address=0x00416c20)
+
+Raw data read:
+
+[6A] Search results:
+- No functions matching 'memcmp'
+- No functions matching 'strncmp'
+- No functions matching 'strcmp'
+
+[6B] Function lookup:
+- Function: FUN_00416c20 at 00416c20
+- Signature: undefined FUN_00416c20(void)
+- Entry: 00416c20
+- Body: 00416c20 - 00416c87
+
+[6C] Decompilation of FUN_00416c20:
+- Returns a function pointer selected by CPU feature flags.
+- This indicates an IFUNC-style resolver choosing optimized implementation at runtime.
+
+Interpretation:
+- `thunk_FUN_00416c20(...)` in validator is consistent with an indirect call to selected `memcmp` implementation.
+- So the validator compares decrypted 49-byte secret directly to user-provided argument bytes.
+
+------------------------------------------------------------
+
+Step 7) Reproduce decrypt operation externally to recover plaintext
+Reason:
+- Fastest way to recover exact password bytes from ciphertext + key.
+
+Action:
+- Ran a Python snippet implementing RC4 with:
+  - key qword: `0x1d6796e070c749b7` as little-endian 8-byte key
+  - ciphertext bytes: the 49 constants from `FUN_00401a09`
+
+Command output read (verbatim):
+
+PT hex: 666c61675f7b4c696e345f443362756767316e675f69535f4d7563485f6640357433725f466f725f746831245f4f6e3321
+PT raw: b'flag_{Lin4_D3bugg1ng_iS_MucH_f@5t3r_For_th1$_On3!'
+PT latin1: flag_{Lin4_D3bugg1ng_iS_MucH_f@5t3r_For_th1$_On3!
+Printable ratio: 49 / 49
+
+Interpretation:
+- Decrypted bytes are fully printable ASCII and length exactly matches compare length (0x31).
+- Therefore recovered password is:
+  `flag_{Lin4_D3bugg1ng_iS_MucH_f@5t3r_For_th1$_On3!`
+
+============================================================
+FINAL RESULT
+============================================================
+
+Recovered password:
+flag_{Lin4_D3bugg1ng_iS_MucH_f@5t3r_For_th1$_On3!
+
+Why this is correct:
+- The binary decrypts a fixed 49-byte blob with a fixed key.
+- The decrypted output is compared byte-for-byte against user input (`memcmp`-style thunk) for 49 bytes.
+- Reproducing that exact decryption produces the string above.
+
+============================================================
+ADDITIONAL CLARIFICATIONS
+============================================================
+
+On the missing closing brace:
+- The recovered plaintext ends with `!` and does not include a trailing `}`.
+- This is not an extraction error; it is exactly what the decryption produced for all 49 bytes.
+
+On "all data read":
+- I included every distinct tool call and all directly decision-relevant raw outputs.
+- The initial bulk strings dump was very large and mostly unrelated runtime/library text; the relevant entries are explicitly preserved above and were the ones interpreted for the password recovery workflow.

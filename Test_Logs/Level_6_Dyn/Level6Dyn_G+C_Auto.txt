@@ -1,0 +1,308 @@
+================================================================================
+PASSWORD RECOVERY ANALYSIS — STEP-BY-STEP LOG
+================================================================================
+Generated: 2026-04-08
+Context: Binary analyzed via Ghidra MCP and Cutter MCP; password derived from
+         static analysis and a small offline Python reversal of the transform.
+
+This document records every automated step, the raw data returned by tools,
+how it was interpreted, and why each inference was made.
+
+================================================================================
+1. GOAL
+================================================================================
+Locate the shutdown / unlock password embedded in the malware sample by
+reverse engineering the password-check path, using both Ghidra and Cutter to
+cross-check and save time.
+
+================================================================================
+2. STRATEGY (WHY THIS ORDER)
+================================================================================
+- Strings and imports are cheap: they often expose prompts ("Usage", success
+  messages) and APIs (memcmp, signal) that anchor the real check.
+- Listing functions gives addresses to decompile next.
+- Decompiling the function that references "Usage" or memcmp typically reveals
+  argv handling and the comparison buffer.
+- Two tools (Ghidra + Cutter) reduce the risk of one decompiler mis-naming
+  locals or mis-typing constants; both were used on the same logic.
+
+================================================================================
+3. STEP 1 — STRING AND IMPORT RECONNAISSANCE (PARALLEL)
+================================================================================
+Tools invoked:
+  - Ghidra: list_strings (limit 2000)
+  - Cutter: list_imports (limit 200)
+  - Cutter: list_functions (limit 200)
+
+3.1 Data read — Ghidra strings (representative / user-relevant subset)
+--------------------------------------------------------------------------------
+The tool returned defined strings including:
+
+  00100394: "/lib64/ld-linux-x86-64.so.2"
+  001004f9: "puts"
+  001004fe: "__libc_start_main"
+  00100510: "raise"
+  00100516: "__cxa_finalize"
+  00100525: "memcmp"
+  0010052c: "printf"
+  00100533: "signal"
+  00100541: "memcpy"
+  ... (section names like .text, .rodata, etc.)
+
+  00102004: "You achieved Level 6!"
+  0010201a: "Sorry, not quite there yet."
+  00102036: "Usage: %s <password>\n"
+
+Interpretation:
+- The three user-facing messages prove the program expects a single command-line
+  argument described as a "password" and branches on success vs failure.
+- Presence of "memcmp" in the dynamic string list suggests a byte-for-byte
+  comparison after some preparation of the input.
+
+3.2 Data read — Cutter imports
+--------------------------------------------------------------------------------
+nth      vaddr bind   type   lib name
+-------------------------------------------------------------
+  1 0x00001030 GLOBAL FUNC       raise
+  2 ---------- GLOBAL FUNC       __libc_start_main
+  4 0x00001040 GLOBAL FUNC       puts
+  5 0x00001050 GLOBAL FUNC       printf
+  6 0x00001060 GLOBAL FUNC       memcmp
+  7 0x00001070 GLOBAL FUNC       signal
+  9 0x00001080 GLOBAL FUNC       memcpy
+ 11 0x00001090 WEAK   FUNC       __cxa_finalize
+
+Interpretation:
+- memcpy + memcmp + signal + raise align with: copy input, optionally disturb
+  execution (signal/raise), then compare transformed buffer to a constant.
+
+3.3 Data read — Cutter function list (partial)
+--------------------------------------------------------------------------------
+  0x000010a0 entry0
+  0x000010d0 fcn.000010d0
+  ...
+  0x0000119d fcn.0000119d
+  0x00001201 fcn.00001201
+  0x000012f6 fcn.000012f6
+
+Interpretation:
+- fcn.000012f6 is a natural next decompile target once the check routine is
+  identified (address aligns with later Ghidra names).
+
+================================================================================
+4. STEP 2 — FIRST GHIDRA DECOMPILE ATTEMPT (ADDRESS MISMATCH)
+================================================================================
+Tools invoked:
+  - Ghidra: decompile_function_by_address for 0x0000119d, 0x00001201, 0x000012f6
+
+Result:
+  "No function found at or containing address ..." for each.
+
+Interpretation / fix:
+- Ghidra’s database used full VA-style symbols (e.g. FUN_001012f6 at 0x001012f6).
+  Querying 0x0000.... addresses did not match how Ghidra named functions in
+  this project. Required listing methods by name or using 0x0010.... addresses.
+
+================================================================================
+5. STEP 3 — GHIDRA METHOD LIST + DECOMPILE
+================================================================================
+Tool invoked:
+  - Ghidra: list_methods (limit 200)
+
+Data read (relevant symbol names):
+--------------------------------------------------------------------------------
+  FUN_001010d0
+  FUN_00101100
+  FUN_00101189
+  FUN_0010119d
+  FUN_00101201
+  FUN_001012f6
+  FUN_00101445
+  entry
+  ... (imports repeated, etc.)
+
+Tools invoked:
+  - Ghidra: decompile_function for FUN_0010119d, FUN_00101201, FUN_001012f6,
+            FUN_00101445
+
+5.1 FUN_0010119d — summary of decompiler output
+--------------------------------------------------------------------------------
+Logic:
+  - Loop i = 0..7: accumulate 8 bytes from param_1 into a 64-bit value in big-
+    endian style (shift left, OR byte).
+  - *param_2 = *param_2 ^ accumulated_value
+
+Interpretation:
+- Small XOR primitive mixing an 8-byte chunk into a running 64-bit state.
+
+5.2 FUN_00101201 — summary of decompiler output
+--------------------------------------------------------------------------------
+Parameters: (buffer pointer, length, 64-bit key material param_3)
+
+Logic:
+  - Split param_3 into 8 bytes (high to low byte order in local_20[]).
+  - For each block of 8 bytes of input (offset 0, 8, 16, ...):
+      - Start with local_18 = block counter (starts 0, increments each block).
+      - Call FUN_0010119d(local_20, &local_28) to XOR local_18 with the 64-bit
+        key bytes → local_28.
+      - XOR each byte of the current 8-byte slice of the buffer with the
+        corresponding byte of local_28 (extracted by shifting).
+
+Constants observed in the caller:
+  - FUN_001012f6 calls FUN_00101201(buffer, 0x2b, 0xaabbccddeeff0011)
+
+Interpretation:
+- This is a deterministic XOR transform over the password bytes using a fixed
+  64-bit pattern and a per-block counter (0, 1, 2, ...). Reversible by applying
+  the same function again (XOR is self-inverse).
+
+5.3 FUN_001012f6 — summary of decompiler output
+--------------------------------------------------------------------------------
+Observed steps:
+  - Embedded 43-byte (0x2b) constant byte array (local_48 .. local_1e region),
+    listed explicitly as hex byte values in the decompilation.
+  - memcpy(local_78, param_1, 0x2b) — copies user input into a stack buffer.
+  - signal(5, FUN_00101189); raise(5); — installs handler and raises signal 5
+    (SIGTRAP on Linux x86-64). Analysis focused on the cryptographic check;
+    behavior may affect debugging or execution environment.
+  - FUN_00101201(local_78, 0x2b, 0xaabbccddeeff0011) — transforms the buffer.
+  - memcmp(local_78, &local_48, 0x2b) — compares transformed input to embedded
+    constant.
+  - Additional condition: DAT_00104040 == 0 (global must be zero for success).
+  - Returns 1 if match and global OK, else 0.
+
+Interpretation:
+- The "password" is whatever ASCII (or raw) 43-byte string that, after the
+  XOR transform, equals the embedded 43-byte blob. Finding it means inverting
+  the transform (re-run same XOR with same key/counter).
+
+5.4 FUN_00101445 — summary of decompiler output
+--------------------------------------------------------------------------------
+Logic:
+  - if argc == 2: call FUN_001012f6(argv[1]); if return == 1 print success string,
+    else print failure string.
+  - else: printf("Usage: %s <password>\n", argv[0]).
+
+Interpretation:
+- Confirms argv[1] is the only secret input and ties UI strings to FUN_001012f6.
+
+================================================================================
+6. STEP 4 — EXTRACT CIPHERTEXT BYTES FROM GHIDRA DECOMPILATION
+================================================================================
+From FUN_001012f6, the ordered embedded bytes after transformation (target for
+memcmp) were read as:
+
+  0xcc, 0xd7, 0xad, 0xba, 0xb1, 0x84, 0x4c, 0x78,
+  0xc4, 0x8d, 0x93, 0x9c, 0x80, 0x8b, 0x31, 0x74,
+  0x99, 0xd9, 0xb9, 0xba, 0x89, 0xde, 0x6e, 0x54,
+  0xf5, 0xd5, 0xff, 0xab, 0xdd, 0x8d, 0x5f, 0x36,
+  0xde, 0xd4, 0x9c, 0xad, 0xdd, 0x9b, 0x5f, 0x58,
+  0x99, 0x9a, 0xb1
+
+Total length: 0x2b = 43 bytes.
+
+================================================================================
+7. STEP 5 — PYTHON REVERSAL OF THE TRANSFORM (OFFLINE)
+================================================================================
+Reason:
+- FUN_00101201 is XOR-based and uses a fixed key 0xaabbccddeeff0011 and a
+  running block index. Applying the same routine to the 43-byte target blob
+  recovers the unique preimage (the password string).
+
+Implementation sketch (equivalent to compiled logic):
+  - key_bytes = bytes.fromhex("aabbccddeeff0011")  # 8 bytes, MSB first
+  - For each block_start in range(0, 43, 8):
+        counter = block_index  # 0, 1, 2, ...
+        Build local10 from key_bytes as 64-bit big-endian value.
+        local28 = counter ^ local10   (matches FUN_0010119d XOR step)
+        For each byte i in 0..7 within the block:
+            if index < 43: ct[index] ^= (local28 >> ((7-i)*8)) & 0xff
+        counter += 1 for next block
+
+Note: The exact loop structure was matched to the Ghidra decompilation of
+FUN_0010119d and FUN_00101201.
+
+7.1 Output of the script
+--------------------------------------------------------------------------------
+  Plaintext hex (43 bytes = 86 hex digits):
+    666c61675f7b4c696e365f416e7431643362756767216e475f6e337633725f24746f507033645f4d33217d
+
+  Decoded as Latin-1 / ASCII:
+    flag_{Lin6_Ant1d3bugg!nG_n3v3r_$toPp3d_M3!}
+
+  To verify independently: run the same XOR routine from section 7 on the
+  43-byte blob in section 6; the result must match this hex and ASCII string.
+
+================================================================================
+8. STEP 6 — CUTTER CROSS-CHECK
+================================================================================
+Tools invoked:
+  - Cutter: decompile_function_by_address 0x000012f6
+  - Cutter: decompile_function_by_address 0x00001201
+
+8.1 fcn.000012f6
+--------------------------------------------------------------------------------
+Cutter/rz-ghidra showed:
+  - Same embedded byte constants.
+  - memcpy of 0x2b bytes from user buffer.
+  - signal(5, ...); raise(5);
+  - Call to fcn.00001201 with third argument displayed as a signed constant
+    -0x554433221100ffef — this is the same bit pattern as unsigned
+    0xaabbccddeeff0011 (decompiler signedness display artifact).
+  - memcmp against the same 43-byte region; success if match and global zero.
+
+Interpretation:
+- Confirms Ghidra’s analysis was not a one-off decompiler artifact; the check
+  and key material are the same.
+
+8.2 fcn.00001201
+--------------------------------------------------------------------------------
+Matches FUN_00101201: per-8-byte block XOR using key bytes and block counter.
+
+================================================================================
+9. FINAL ANSWER (PASSWORD STRING)
+================================================================================
+Recovered password (43 characters):
+
+  flag_{Lin6_Ant1d3bugg!nG_n3v3r_$toPp3d_M3!}
+
+Meaning of components in code terms:
+- This string is the preimage of the embedded 43-byte blob under FUN_00101201.
+- Passing it as argv[1] causes memcmp to succeed (subject to DAT_00104040 == 0).
+
+================================================================================
+10. EXACT PYTHON SCRIPT USED TO RECOVER PLAINTEXT (REPRODUCIBLE)
+================================================================================
+--- begin python ---
+ct = bytes([
+0xcc,0xd7,0xad,0xba,0xb1,0x84,0x4c,0x78,0xc4,0x8d,0x93,0x9c,0x80,0x8b,0x31,0x74,
+0x99,0xd9,0xb9,0xba,0x89,0xde,0x6e,0x54,0xf5,0xd5,0xff,0xab,0xdd,0x8d,0x5f,0x36,
+0xde,0xd4,0x9c,0xad,0xdd,0x9b,0x5f,0x58,0x99,0x9a,0xb1
+])
+key_bytes = bytes.fromhex('aabbccddeeff0011')
+out = bytearray(ct)
+counter = 0
+for block_start in range(0, len(out), 8):
+    local10 = 0
+    for b in key_bytes:
+        local10 = b | ((local10 << 8) & ((1<<128)-1))
+    local28 = counter ^ local10
+    for i in range(8):
+        idx = block_start + i
+        if idx >= len(out): break
+        shift = (7 - i) * 8
+        out[idx] ^= (local28 >> shift) & 0xff
+    counter += 1
+print('plaintext hex:', out.hex())
+print('ascii:', out.decode('latin1'))
+--- end python ---
+
+================================================================================
+11. FILES AND PATHS
+================================================================================
+This log saved as:
+  /home/kali/Documents/MCPTesting/Test_Logs/ransomware_password_analysis_log.txt
+
+================================================================================
+END OF LOG
+================================================================================

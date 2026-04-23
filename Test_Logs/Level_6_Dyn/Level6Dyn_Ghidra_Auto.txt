@@ -1,0 +1,222 @@
+Ransomware Password Recovery Log
+Date: 2026-03-31
+Analyst: Cursor AI agent
+Scope: Recover shutdown/check password from loaded Ghidra sample
+
+================================================================
+1) Goal Identification
+================================================================
+User objective:
+- Find a password embedded in the malware sample that is used to shut down / satisfy a check.
+
+Initial working hypothesis:
+- A password is often validated via string compare, byte compare, hashing, or transform-then-compare.
+- In stripped binaries, this is commonly done via libc calls like memcmp/strcmp/strncmp.
+
+Why this approach:
+- Starting from imports and strings is the fastest way to locate auth/check logic in small C binaries.
+
+================================================================
+2) First Data Collection (Broad Triage)
+================================================================
+Tools used in parallel:
+1. get_current_function
+2. list_imports(limit=200)
+3. list_strings(limit=4000)
+
+----------------------------------------------------------------
+2.1) Data: current function
+----------------------------------------------------------------
+Output:
+- Function: entry at 001010a0
+- Signature: undefined processEntry entry(void)
+
+Interpretation:
+- Binary has normal ELF entry point.
+- No immediate password details yet.
+
+----------------------------------------------------------------
+2.2) Data: imports
+----------------------------------------------------------------
+Output included these notable imports:
+- __libc_start_main
+- puts
+- printf
+- memcmp
+- signal
+- memcpy
+- raise
+
+Interpretation:
+- memcmp is highly relevant to credential checking.
+- memcpy + memcmp combo commonly means "copy user input, transform, compare with static bytes."
+- signal + raise can indicate anti-debug trickery (intentional signal trigger then handler-based behavior).
+
+Why this mattered:
+- It narrowed focus to functions calling memcmp/signal/raise.
+
+----------------------------------------------------------------
+2.3) Data: strings
+----------------------------------------------------------------
+Important strings recovered:
+- "You achieved Level 6!"
+- "Sorry, not quite there yet."
+- "Usage: %s <password>\n"
+- "zR" (short repeated string in rodata)
+
+Interpretation:
+- Program clearly expects one command-line argument named password.
+- Success/fail messages indicate a Boolean-style validation function.
+- "zR" is too short/noisy to be directly useful as plaintext password.
+
+Why this mattered:
+- Confirmed there is explicit password validation path and user input format.
+
+================================================================
+3) Function Discovery and Targeting
+================================================================
+Tool used:
+- list_functions
+
+Relevant discovered functions:
+- entry at 001010a0
+- FUN_001012f6
+- FUN_00101445
+- helper routines at 00101189, 0010119d, 00101201
+
+Interpretation:
+- Address clustering suggested 001012f6 likely does core check logic.
+- 00101445 looked like argument handling / main wrapper.
+
+Why this mattered:
+- Established exact decompilation targets for core logic extraction.
+
+================================================================
+4) Decompilation of Candidate Functions
+================================================================
+Tools used in parallel:
+- decompile_function_by_address(0x00101189)
+- decompile_function_by_address(0x0010119d)
+- decompile_function_by_address(0x00101201)
+- decompile_function_by_address(0x001012f6)
+- decompile_function_by_address(0x00101445)
+
+----------------------------------------------------------------
+4.1) Data + interpretation: FUN_00101445
+----------------------------------------------------------------
+Observed logic:
+- If argc == 2, call FUN_001012f6(argv[1]).
+- If return == 1 -> puts("You achieved Level 6!")
+- Else -> puts("Sorry, not quite there yet.")
+- Else branch for wrong argc prints usage with "<password>".
+
+Interpretation:
+- FUN_001012f6 is definitively the password checker.
+
+----------------------------------------------------------------
+4.2) Data + interpretation: FUN_001012f6 (core checker)
+----------------------------------------------------------------
+Observed operations:
+1. Builds a 43-byte local byte array with hardcoded constants:
+   cc d7 ad ba b1 84 4c 78 c4 8d 93 9c 80 8b 31 74
+   99 d9 b9 ba 89 de 6e 54 f5 d5 ff ab dd 8d 5f 36
+   de d4 9c ad dd 9b 5f 58 99 9a b1
+2. memcpy(local_78, param_1, 0x2b)  -> copies 43 bytes from user input.
+3. signal(5, FUN_00101189); raise(5);
+4. Calls FUN_00101201(local_78, 0x2b, 0xaabbccddeeff0011).
+5. memcmp(local_78, &hardcoded_bytes, 0x2b).
+6. Returns success only if memcmp == 0 AND DAT_00104040 == 0.
+
+Interpretation:
+- This is not plaintext compare. Input is transformed first.
+- Length is exactly 43 bytes.
+- Key constant is 0xAABBCCDDEEFF0011.
+- signal/raise pair is anti-debug themed; handler sets DAT_00104040 = 0.
+
+Why this mattered:
+- Provided complete equation to invert:
+  transform(user_input) == hardcoded_cipher_bytes
+
+----------------------------------------------------------------
+4.3) Data + interpretation: FUN_00101189
+----------------------------------------------------------------
+Observed:
+- DAT_00104040 = 0; return;
+
+Interpretation:
+- Signal handler clears flag; success condition requires this value be 0.
+- Since function explicitly sets 0, anti-debug check does not block normal flow here.
+
+----------------------------------------------------------------
+4.4) Data + interpretation: FUN_0010119d
+----------------------------------------------------------------
+Observed:
+- Reads 8 bytes from param_1 into 64-bit value (big-endian style assembly loop).
+- XORs that with *param_2.
+
+Interpretation:
+- This creates a per-block 64-bit value by XORing fixed 8-byte key with counter/state.
+
+----------------------------------------------------------------
+4.5) Data + interpretation: FUN_00101201 (transform)
+----------------------------------------------------------------
+Observed:
+- Converts 64-bit key (0xaabbccddeeff0011) into 8 bytes.
+- For each 8-byte block in input:
+  - local_28 = counter
+  - FUN_0010119d(key_bytes, &local_28)  => local_28 = key64 XOR counter
+  - XORs each input byte with bytes of local_28
+  - increments counter
+
+Interpretation:
+- This is a deterministic XOR stream over blocks:
+  keystream_block(i) = key64 XOR i
+- Therefore inversion is straightforward:
+  plaintext = cipher XOR keystream
+
+Why this mattered:
+- Enabled direct mathematical recovery of required password without brute force.
+
+================================================================
+5) Recovery Calculation
+================================================================
+Method used:
+- Reimplemented transform in Python and reversed it by XORing hardcoded bytes with identical keystream.
+
+Exact script behavior:
+- Loads 43-byte target (the memcmp right-hand side).
+- Builds key bytes from 0xAABBCCDDEEFF0011.
+- For each block index i, computes 64-bit stream = key ^ i.
+- Extracts stream bytes in same order as binary.
+- XORs stream with target bytes to obtain original required input.
+
+Python output captured:
+- arr aabbccddeeff0011
+- keystream aabbccddeeff0011aabbccddeeff0010aabbccddeeff0013aabbccddeeff0012aabbccddeeff0015aabbcc
+- plain hex 666c61675f7b4c696e365f416e7431643362756767216e475f6e337633725f24746f507033645f4d33217d
+- plain repr b'flag_{Lin6_Ant1d3bugg!nG_n3v3r_$toPp3d_M3!}'
+- ascii? True
+
+Interpretation:
+- Result is printable ASCII and CTF-style flag format.
+- This strongly validates correctness.
+
+================================================================
+6) Final Recovered Password
+================================================================
+flag_{Lin6_Ant1d3bugg!nG_n3v3r_$toPp3d_M3!}
+
+================================================================
+7) Confidence and Validation Notes
+================================================================
+Confidence: High
+
+Reasoning:
+- Recovered value directly satisfies inverse of the exact transform used before memcmp.
+- Length matches required 0x2b (43 bytes).
+- Output is coherent readable text in expected format.
+- Logic path from argv -> checker -> transform -> memcmp was fully traced.
+
+Potential caveat:
+- If binary contains additional runtime environment checks not exercised in static trace, behavior could vary, but password derivation itself is mathematically tied to memcmp target and transform key.
+

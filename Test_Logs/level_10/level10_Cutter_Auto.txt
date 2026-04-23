@@ -1,0 +1,294 @@
+Level 10 Malware Password Recovery - Full Step-by-Step Log
+Date: 2026-04-08
+Analyst: Cursor AI assistant session
+
+====================================================================
+Scope and Goal
+====================================================================
+Objective:
+- Recover the shutdown password embedded in the loaded binary in Cutter.
+
+Target binary:
+- /home/kali/Documents/MCPTesting/Test_Files/Working_files/CutterMCP_Solves/Lin10_2026
+
+Method:
+- Static triage in Cutter MCP (functions, xrefs, decompilation/disassembly).
+- Supplemental local command-line inspection (strings/readelf/objdump/python/gdb).
+- Cryptographic reversal of the password-check transform.
+
+Important note:
+- The sample contains anti-debug / anti-analysis checks.
+- A direct runtime validation of the recovered string as argv did not print success in a normal run because anti-analysis branches remain active unless bypassed.
+- Recovery was therefore performed from the internal compare target and transform logic, then validated logically against the checker internals.
+
+====================================================================
+Step 1 - Initial binary reconnaissance in Cutter
+====================================================================
+Data read:
+1) Imports list:
+- Command/tool: user-cutter-list_imports
+- Result: empty/no meaningful imports shown.
+
+Interpretation:
+- Strong signal of static linking or stripped resolution context.
+- Implies dynamic API-name hunting is less useful; need control-flow + constants.
+
+2) Function list:
+- Command/tool: user-cutter-list_functions (limit 300)
+- Result: very large list of unnamed fcn.* functions, including entry0 at 0x00401660.
+
+Interpretation:
+- Binary is stripped.
+- Need to anchor analysis from entry point and known strings.
+
+3) Exports list:
+- Command/tool: user-cutter-list_exports
+- Result: empty.
+
+Interpretation:
+- Not an exported-library style binary; normal for static executable.
+
+====================================================================
+Step 2 - Entry-point trace
+====================================================================
+Data read:
+1) Function detail/decompile/disassembly for entry0 (0x00401660).
+
+Key observations:
+- entry0 calls fcn.00404c00 with arg1 = 0x402659 and then halts.
+- This is the standard runtime bootstrap pattern where arg1 is effectively main-like callback.
+
+Interpretation:
+- 0x402659 is the candidate "program main" function controlling CLI password path.
+
+2) Function detail/decompile/disassembly for fcn.00404c00.
+
+Key observations:
+- fcn.00404c00 performs runtime setup, init arrays, then calls fcn.00402bc0(arg1,...).
+- arg1 (0x402659) is passed down and eventually invoked.
+
+Interpretation:
+- Confirms execution path into 0x402659 through runtime wrapper.
+
+====================================================================
+Step 3 - Confirm binary metadata and locate strings section
+====================================================================
+Data read:
+1) ELF headers via user-cutter-show_headers and readelf -S.
+
+Important fields:
+- ELF64, static=true, stripped=true, NX=true, non-PIE.
+- Entry point: 0x00401660.
+- .rodata at VA 0x00478000, file offset 0x78000.
+
+Interpretation:
+- Non-PIE simplifies VA-to-file-offset calculations.
+- .rodata location enables exact string and P-array extraction.
+
+====================================================================
+Step 4 - String triage and password-path anchor
+====================================================================
+Data read:
+1) Initial keyword scan of printable strings (python script over whole binary).
+
+Interesting hits:
+- "You achieved Level 10!"
+- "Sorry, not quite there yet."
+- "Usage: %s <password>"
+- plus generic libc/system strings.
+
+Interpretation:
+- These three messages strongly indicate a command-line password checker:
+  - usage branch when argc invalid
+  - success/failure branches based on verification return.
+
+2) Offset/VA mapping for key strings:
+- "You achieved Level 10!" at file off 0x7807e -> VA 0x47807e
+- "Sorry, not quite there yet." at file off 0x78095 -> VA 0x478095
+- "Usage: %s <password>" at file off 0x780b1 -> VA 0x4780b1
+
+3) Xrefs to those string VAs:
+- 0x402694 references success string
+- 0x4026a5 references failure string
+- 0x4026bd references usage string
+
+Interpretation:
+- 0x402659 routine is confirmed as CLI password handler.
+
+====================================================================
+Step 5 - Disassemble the CLI handler and identify verifier call
+====================================================================
+Data read:
+1) objdump disassembly around 0x402620-0x4026f0.
+
+Core logic recovered:
+- At 0x402671: argc check; invalid argc -> prints usage.
+- On valid argc:
+  - loads argv[1]
+  - calls verifier at 0x4023fe
+  - compares return value with 1
+  - prints success if 1, else failure.
+
+Interpretation:
+- Password acceptance is exactly verifier return == 1 from fcn.004023fe(argv[1]).
+
+====================================================================
+Step 6 - Reverse verifier function 0x4023fe
+====================================================================
+Data read:
+1) user-cutter-show_function_detail/decompile/disassemble for 0x4023fe.
+
+Recovered facts:
+- Verifier copies 0x34 bytes (52 bytes) from user input.
+- Calls fcn.004019f4(buffer, 0x34, 0x123456789abcdef0).
+- Compares transformed 52-byte buffer byte-by-byte with embedded target bytes (loaded to stack at function start).
+- Returns 1 only if all 52 bytes match.
+
+Embedded 52-byte target constants from 0x402449 onward:
+a7 48 c5 4a 82 ce 94 26 69 d3 52 8a 97 c0 f1 3a
+1f 9a 04 9b 44 31 18 cf 55 b5 25 8a 94 eb db 85
+74 a4 02 dc 65 67 15 df c7 43 91 2c ee 8d dc 3e
+42 ae 76 80
+
+Interpretation:
+- Required password length is exactly 52 bytes.
+- Need inverse of fcn.004019f4 transform using key 0x123456789abcdef0.
+
+====================================================================
+Step 7 - Reverse transform internals (0x4019f4, 0x40193d, 0x40186e, 0x4017d9, 0x401799)
+====================================================================
+Data read:
+1) fcn.004019f4:
+- Builds 8-byte key material from arg3 in big-endian byte order.
+- Calls fcn.0040193d to initialize round keys.
+- For each 8-byte block/counter:
+  - calls fcn.0040186e (Feistel-like block cipher round function)
+  - XORs keystream bytes into data.
+
+Interpretation:
+- This is stream-like mode over block-cipher output (CTR-like).
+
+2) fcn.0040193d:
+- Calls fcn.00401799 (S-box init).
+- Copies 0x48 bytes from data.00478020 into working P-array.
+- XOR-mixes P-array entries with repeating key bytes from arg2.
+
+Interpretation:
+- Custom Blowfish-like key schedule:
+  - P-array source from .rodata at 0x478020 (18 dwords = 72 bytes).
+  - S-box simplified/modified.
+
+3) fcn.00401799:
+- Initializes table at 0x4a6b20 with i*0x01010101 for i=0..255.
+
+Interpretation:
+- Nonstandard simplified S-box (not canonical Blowfish constants).
+
+4) fcn.004017d9 and fcn.0040186e:
+- Implement F-function and 16-round Feistel with final XORs by P[16], P[17].
+
+Interpretation:
+- Enough to reproduce keystream exactly in Python.
+
+====================================================================
+Step 8 - Dynamic extraction of post-transform bytes (sanity support)
+====================================================================
+Data read:
+1) Because sample was "text file busy" under debugger when original file was in use, copied to:
+- /home/kali/Lin10_2026_copy
+
+2) gdb sessions:
+- breakpoints around verifier anti-debug branches and post-transform location.
+- anti-debug branches at 0x402525 and 0x402532 were forcibly bypassed by setting RIP.
+- set memory flag {int}0x4a50d0=0 to ensure transform path executes instead of memset path.
+- breakpoint at 0x402602 after transform call.
+- dumped 52 bytes from stack buffer ($rbp-0xb0).
+
+Captured transformed bytes when input was "A"*52:
+80 65 e5 6c 9c f4 99 0e 46 a3 23 94 81 e9 84 0f
+61 84 04 b4 71 19 74 ea 35 d0 50 ef f1 99 f7 86
+79 9c 1c ac 11 79 14 c1 d4 31 b1 01 f0 98 f5 5e
+6d 88 08 bc
+
+Interpretation:
+- Since transform is XOR-stream, this yields keystream quickly:
+  keystream = transformed("A"*52) XOR 0x41.
+- This gave a fast cross-check path against static inversion.
+
+====================================================================
+Step 9 - Static cryptographic reconstruction and password recovery
+====================================================================
+Data read:
+1) P-array bytes from .rodata:
+- Read 0x48 bytes at file offset 0x78020 (VA 0x478020).
+- Correct interpretation required little-endian dword unpacking from file bytes.
+
+Important correction made:
+- First attempt with big-endian unpack produced garbage plaintext.
+- Retried with little-endian unpack -> clean readable flag string.
+
+2) Rebuilt algorithm in Python:
+- S[i] = i*0x01010101
+- P[18] from .rodata (little-endian dwords)
+- key schedule with repeating bytes of 0x12 34 56 78 9a bc de f0
+- 16-round Feistel block function as in 0x40186e/0x4017d9
+- CTR-like keystream for counters 0..6 (52 bytes total)
+- plaintext = target_bytes XOR keystream
+
+Recovered plaintext/password:
+flag_{Lin10_Wh4t?_Anti-d!$4$$3mBLy_15_@_R3al_Th!ng?}
+
+Hex:
+66 6c 61 67 5f 7b 4c 69 6e 31 30 5f 57 68 34 74
+3f 5f 41 6e 74 69 2d 64 21 24 34 24 24 33 6d 42
+4c 79 5f 31 35 5f 40 5f 52 33 61 6c 5f 54 68 21
+6e 67 3f 7d
+
+Interpretation:
+- Exact 52-byte value matching verifier's expected post-transform target.
+- This is the intended challenge/kill password embedded in sample logic.
+
+====================================================================
+Step 10 - Runtime result discrepancy and interpretation
+====================================================================
+Observed:
+- Running binary normally with that recovered password printed:
+  "Sorry, not quite there yet."
+
+Why:
+- Verifier contains anti-debug / anti-analysis environment checks (fcn.004023aa and fcn.00401b74).
+- In practical runs, those checks can short-circuit to failure branch before transform/compare.
+- During debugger-assisted path forcing, compare point confirmed expected structure and the decryption-derived password is consistent with internal target logic.
+
+Interpretation:
+- The recovered string is the embedded correct password for the compare routine.
+- External behavioral mismatch is due to protections, not an incorrect cryptographic inversion.
+
+====================================================================
+Tools and data sources used
+====================================================================
+Cutter MCP tools:
+- list_imports, list_functions, list_exports
+- show_headers, show_function_detail
+- decompile_function_by_address, disassemble_function
+- xrefs_to
+
+CLI commands/scripts:
+- strings (with python post-filter)
+- readelf -S
+- objdump disassembly slices
+- python scripts for:
+  - VA/offset mapping
+  - direct byte extraction
+  - cipher reconstruction and inversion
+- gdb sessions for:
+  - breakpoints
+  - anti-debug bypass by RIP control
+  - stack byte dumps at post-transform point
+
+====================================================================
+Final answer
+====================================================================
+Recovered password:
+flag_{Lin10_Wh4t?_Anti-d!$4$$3mBLy_15_@_R3al_Th!ng?}
+

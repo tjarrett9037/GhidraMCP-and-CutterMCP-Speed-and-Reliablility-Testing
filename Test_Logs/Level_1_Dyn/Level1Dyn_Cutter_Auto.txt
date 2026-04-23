@@ -1,0 +1,151 @@
+Ransomware Password Discovery - Full Investigation Log
+Date: 2026-04-07
+Analyst: Cursor AI Agent
+Objective: Identify password used by loaded sample in Cutter that appears to control/validate a shutdown or challenge path.
+
+================================================================
+1) Initial Hypothesis and Approach
+================================================================
+Hypothesis:
+- If a shutdown/kill-switch password exists in a simple ELF binary, it is commonly checked in:
+  - main()
+  - argument parsing logic
+  - string compare branches (strcmp/strncmp/memcmp)
+  - hardcoded string literals in .rodata
+
+Approach:
+- Enumerate imports to detect compare/string routines.
+- Enumerate functions to find likely control logic entry points.
+- Decompile main first (most probable location in small binaries).
+- Confirm exact literal being compared and output behavior.
+
+Reasoning:
+- Small binaries often perform command-line password checks directly in main.
+- Presence of strcmp import is a strong indicator of literal string comparison.
+
+================================================================
+2) Tool Calls and Raw Data Collected
+================================================================
+The following three Cutter queries were executed in parallel:
+
+----------------------------------------------------------------
+2.1) list_imports(offset=0, limit=200)
+----------------------------------------------------------------
+Raw output:
+nth      vaddr bind   type   lib name                        
+-------------------------------------------------------------  
+1 ---------- GLOBAL FUNC       __libc_start_main  
+2 ---------- WEAK   NOTYPE     _ITM_deregisterTMCloneTable  
+3 0x00001030 GLOBAL FUNC       puts  
+4 0x00001040 GLOBAL FUNC       printf  
+5 0x00001050 GLOBAL FUNC       strcmp  
+6 ---------- WEAK   NOTYPE     __gmon_start__  
+7 ---------- WEAK   NOTYPE     _ITM_registerTMCloneTable  
+8 0x00001060 WEAK   FUNC       __cxa_finalize
+
+Interpretation:
+- Key signal: imported strcmp at 0x00001050.
+- Supporting signal: puts/printf indicate user-facing pass/fail messages.
+- This strongly suggests direct string comparison flow in the binary.
+
+Why this mattered:
+- It narrowed search to argument handling and string literal compare paths.
+
+----------------------------------------------------------------
+2.2) list_functions(offset=0, limit=300)
+----------------------------------------------------------------
+Raw output:
+0x00001000 sym._init
+0x00001030 sym.imp.puts
+0x00001040 sym.imp.printf
+0x00001050 sym.imp.strcmp
+0x00001060 sym.imp.__cxa_finalize
+0x00001070 entry0
+0x000010a0 sym.deregister_tm_clones
+0x000010d0 sym.register_tm_clones
+0x00001110 sym.__do_global_dtors_aux
+0x00001150 entry.init0
+0x00001159 main
+0x000011dc sym._fini
+
+Interpretation:
+- Very small function set; only one meaningful application routine: main at 0x00001159.
+- No additional complex routines or obfuscated helper functions visible at this level.
+
+Why this mattered:
+- Made main() the highest-confidence target for immediate decompilation.
+
+----------------------------------------------------------------
+2.3) list_exports(offset=0, limit=100)
+----------------------------------------------------------------
+Raw output:
+nth      paddr      vaddr bind   type   size lib name           
+----------------------------------------------------------------
+22 ---------- 0x00004028 GLOBAL NOTYPE    0     _edata
+23 0x000011dc 0x000011dc GLOBAL FUNC      0     _fini
+25 0x00003018 0x00004018 GLOBAL NOTYPE    0     __data_start
+28 0x00003020 0x00004020 GLOBAL OBJ       0     __dso_handle
+29 0x00002000 0x00002000 GLOBAL OBJ       4     _IO_stdin_used
+30 ---------- 0x00004030 GLOBAL NOTYPE    0     _end
+31 0x00001070 0x00001070 GLOBAL FUNC     34     _start
+32 ---------- 0x00004028 GLOBAL NOTYPE    0     __bss_start
+33 0x00001159 0x00001159 GLOBAL FUNC    128     main
+34 ---------- 0x00004028 GLOBAL OBJ       0     __TMC_END__
+37 0x00001000 0x00001000 GLOBAL FUNC      0     _init
+
+Interpretation:
+- main size is 128 bytes (small/simple logic).
+- Export profile is standard minimal ELF runtime; no exported custom crypto/check functions.
+
+Why this mattered:
+- Reinforced that password check likely lives entirely in main with plain libc calls.
+
+================================================================
+3) Targeted Decompilation
+================================================================
+Executed:
+- decompile_function_by_address(address=0x00001159)
+
+Raw decompiler output:
+
+uint32_t main(int argc, char **argv)
+{
+    char **s1;
+    unsigned long long var_1ch;
+    uint32_t var_ch;
+    
+    if (argc == 2) {
+        var_ch = strcmp(argv[1], "flag_{Lin1_Th4tS_wHy_y0u_@Lw4y5_$t4rT_w1tH_stR!n6$!}");
+        if (var_ch == 0) {
+            puts("You achieved Level 1!");
+        } else {
+            puts("Sorry, not quite there yet.");
+        }
+    } else {
+        printf("Usage: %s <password>\n", *argv);
+    }
+    return var_ch;
+}
+
+Interpretation:
+- The binary checks exactly one CLI argument (argc == 2).
+- It compares argv[1] to a hardcoded literal via strcmp.
+- strcmp == 0 path is the success branch.
+- Therefore the compared literal is the required password for this check path.
+
+================================================================
+4) Final Result
+================================================================
+Recovered password literal:
+flag_{Lin1_Th4tS_wHy_y0u_@Lw4y5_$t4rT_w1tH_stR!n6$!}
+
+Confidence:
+- High.
+- Reason: direct decompiler evidence of exact strcmp argument in main.
+
+================================================================
+5) Notes on Interpretation Scope
+================================================================
+- This log identifies the password accepted by the binary's visible validation branch.
+- The observed success message indicates challenge/level progression behavior.
+- Whether it "shuts down malware" operationally depends on broader runtime context, but this string is definitively the checked password in the loaded sample's main logic.

@@ -1,0 +1,258 @@
+Ransomware Shutdown Password Recovery Log
+Date: 2026-04-08
+Analyst: Cursor coding agent session
+
+Objective
+- Find the password/key expected by the loaded ransomware sample in Cutter that shuts down/disarms behavior.
+
+Method
+- Static reverse engineering through Cutter MCP tools:
+  - Enumerate imports/functions
+  - Identify candidate verification paths
+  - Decompile key functions
+  - Reconstruct crypto/validation routine
+  - Decode expected plaintext input
+
+----------------------------------------------------------------
+1) Initial enumeration and triage
+----------------------------------------------------------------
+
+Step 1.1 - Listed imports
+Tool call:
+- user-cutter-list_imports(offset=0, limit=200)
+
+Data read:
+- raise
+- __libc_start_main
+- puts
+- clock_gettime
+- fclose
+- opendir
+- strlen
+- printf
+- snprintf
+- memset
+- closedir
+- fgets
+- strcmp
+- signal
+- memcpy
+- readdir
+- ptrace
+- fopen
+- __cxa_finalize
+
+Interpretation / why it mattered:
+- `strcmp`, `fgets`, and `printf` suggested potential user-input and comparison logic.
+- `ptrace` and `/proc`-related functions suggested anti-debug/anti-analysis checks that could guard password logic.
+
+Step 1.2 - Listed functions
+Tool call:
+- user-cutter-list_functions(offset=0, limit=300)
+
+Data read:
+- Imports at PLT-like addresses and internal functions:
+  - 0x00001180
+  - 0x0000124d
+  - 0x0000128d
+  - 0x00001322
+  - 0x000013f1
+  - 0x000014a8
+  - 0x00001628
+  - 0x00001e5e
+  - 0x00001eb2
+
+Interpretation / why it mattered:
+- No symbol names for business logic (stripped binary), so address-based decompilation was required.
+
+Step 1.3 - Name-based hunt for obvious password functions
+Tool calls:
+- user-cutter-search_functions_by_name("pass")
+- user-cutter-search_functions_by_name("key")
+- user-cutter-search_functions_by_name("stop")
+- user-cutter-search_functions_by_name("kill")
+
+Data read:
+- No matches returned for these queries.
+
+Interpretation / why it mattered:
+- Confirmed no obvious named handler; had to infer validation logic from behavior and control flow.
+
+----------------------------------------------------------------
+2) Decompilation pass over core internal functions
+----------------------------------------------------------------
+
+Step 2.1 - Decompiled 0x00001628
+Tool call:
+- user-cutter-decompile_function_by_address("0x00001628")
+
+Data read (key points):
+- Opens `/proc`, iterates process directories, reads `/proc/<pid>/comm`
+- Builds and compares process-name strings via `strcmp` against multiple names (constructed byte-by-byte)
+- Returns 1 if suspicious process found, else 0
+
+Recovered compared names (from byte assignments):
+- gdb
+- lldb
+- radare2
+- ida64
+- cutter
+- strace
+- ltrace
+- valgrind
+- binaryninja
+- edb
+
+Interpretation / why it mattered:
+- This is anti-analysis/anti-debugging process detection, not the password itself.
+- Important because main validator likely aborts if these tools are detected.
+
+Step 2.2 - Decompiled 0x000014a8
+Tool call:
+- user-cutter-decompile_function_by_address("0x000014a8")
+
+Data read (key points):
+- Accepts buffer pointer + length + constant key material.
+- Uses an incrementing counter block and encryption round function.
+- XORs generated 8-byte keystream with buffer bytes in-place.
+- Called with key `0x123456789abcdef0`.
+
+Interpretation / why it mattered:
+- This is stream-XOR transformation; same routine can encrypt/decrypt.
+- Strong sign this is used to transform input before comparing with embedded ciphertext.
+
+Step 2.3 - Decompiled 0x000013f1
+Tool call:
+- user-cutter-decompile_function_by_address("0x000013f1")
+
+Data read (key points):
+- Initializes state from `data.00003020` (18-word array, P-array style)
+- XOR-mixes key bytes into round keys
+
+Interpretation / why it mattered:
+- Key schedule behavior consistent with Blowfish-like setup.
+
+Step 2.4 - Decompiled 0x00001322
+Tool call:
+- user-cutter-decompile_function_by_address("0x00001322")
+
+Data read (key points):
+- 16 rounds with swap/XOR/F-function
+- final post-round XOR using entries at offsets `+0x40`, `+0x44`
+
+Interpretation / why it mattered:
+- Confirms Blowfish-like block primitive used as keystream generator.
+
+Step 2.5 - Decompiled 0x0000128d
+Tool call:
+- user-cutter-decompile_function_by_address("0x0000128d")
+
+Data read (key points):
+- F-function uses table lookups on bytes of input word with arithmetic/xor composition
+
+Interpretation / why it mattered:
+- Supports crypto primitive reconstruction for offline decode.
+
+Step 2.6 - Decompiled remaining top-level helpers
+Tool calls:
+- user-cutter-decompile_function_by_address("0x00001e5e")
+- user-cutter-decompile_function_by_address("0x00001eb2")
+- user-cutter-decompile_function_by_address("0x0000124d")
+- user-cutter-decompile_function_by_address("0x00001180")
+
+Data read / interpretation:
+- 0x00001e5e: `ptrace` anti-debug check; returns true when debugger detected.
+- 0x0000124d: initializes substitution table with `i * 0x01010101`.
+- 0x00001180: trivial empty function.
+- 0x00001eb2: main validation routine (critical), described below in detail.
+
+----------------------------------------------------------------
+3) Main verification routine analysis (0x00001eb2)
+----------------------------------------------------------------
+
+Critical data read from decompilation:
+
+3.1 Anti-analysis gates:
+- Calls anti-debug check (`fcn.00001e5e`)
+- Calls anti-tool process scan (`fcn.00001628`)
+- Measures timing with `clock_gettime`; fails if elapsed >= 0x1f5 ms (~501ms)
+
+Interpretation:
+- Input only validated if environment appears non-instrumented and fast enough.
+
+3.2 Embedded byte array (52 bytes):
+- Loaded into local variables (`var_78h`, `var_70h`...`var_45h`)
+- Exact bytes:
+  a7 48 c5 4a 82 ce 94 26
+  69 d3 52 8a 97 c0 f1 3a
+  1f 9a 04 9b 44 31 18 cf
+  55 b5 25 8a 94 eb db 85
+  74 a4 02 dc 65 67 15 df
+  c7 43 91 2c ee 8d dc 3e
+  42 ae 76 80
+
+Interpretation:
+- This is the comparison target (ciphertext or transformed reference).
+
+3.3 User input handling:
+- Copies 0x34 bytes from input argument into local buffer.
+- Runs `fcn.000014a8(local_buf, 0x34, 0x123456789abcdef0)`.
+- Compares each transformed byte against the embedded 52-byte array.
+- Returns success (`1`) only if all bytes match.
+
+Interpretation:
+- Expected password is plaintext that, after this transform, equals embedded bytes.
+- Therefore decrypting embedded bytes with the same keystream yields plaintext password.
+
+----------------------------------------------------------------
+4) Offline decode execution
+----------------------------------------------------------------
+
+Step 4.1 - Built Python decoder mirroring binary logic
+Execution environment:
+- Shell tool, Python3 inline script
+
+Data used in script:
+- Ciphertext bytes: the 52-byte array from 0x00001eb2.
+- Key: `0x123456789abcdef0`.
+- State init:
+  - S table from `i * 0x01010101` (from 0x0000124d)
+  - Blowfish P-array constants as `data.00003020` equivalent:
+    243F6A88 85A308D3 13198A2E 03707344
+    A4093822 299F31D0 082EFA98 EC4E6C89
+    452821E6 38D01377 BE5466CF 34E90C6C
+    C0AC29B7 C97C50DD 3F84D5B5 B5470917
+    9216D5D9 8979FB1B
+- Counter mode:
+  - Counter starts at 0 and increments per 8-byte block.
+  - Keystream block = encrypted counter block.
+  - Plaintext = ciphertext XOR keystream.
+
+Why this interpretation is correct:
+- Decompiled 0x000014a8 explicitly XORs generated stream bytes with input.
+- XOR stream transform is symmetric; same routine decrypts encrypted bytes.
+
+Step 4.2 - Result from script
+Raw output observed:
+- bytearray:
+  b'flag_{Lin10_Wh4t?_Anti-d!$4$$3mBLy_15_@_R3al_Th!ng?}'
+- UTF-8 decoded string:
+  flag_{Lin10_Wh4t?_Anti-d!$4$$3mBLy_15_@_R3al_Th!ng?}
+- Hex:
+  666c61675f7b4c696e31305f576834743f5f416e74692d642124342424336d424c795f31355f405f5233616c5f5468216e673f7d
+
+Interpretation:
+- This decoded plaintext is the exact expected shutdown/disarm input checked by the validator.
+
+----------------------------------------------------------------
+5) Final recovered password
+----------------------------------------------------------------
+
+Recovered shutdown password/key:
+- flag_{Lin10_Wh4t?_Anti-d!$4$$3mBLy_15_@_R3al_Th!ng?}
+
+Confidence:
+- High. Derived directly from reversing the routine that gates success return in the binary.
+
+Notes:
+- The sample contains anti-debug/anti-analysis checks and timing guard that can cause false failures if tested under instrumentation.

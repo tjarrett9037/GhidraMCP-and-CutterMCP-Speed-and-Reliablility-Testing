@@ -1,0 +1,323 @@
+================================================================================
+REVERSE ENGINEERING LOG: COMMAND-LINE PASSWORD RECOVERY
+================================================================================
+Purpose: Document every tool invocation, data observed, interpretation, and
+         reasoning used to recover the password checked by the analyzed ELF.
+
+Output artifact: This file.
+Target context: Binary loaded in Ghidra and Cutter (MCP integration). Analysis
+                treated the sample as malware with a possible "shutdown"
+                password; behavior matched a small challenge binary (Level 7).
+
+Date of analysis session: 2026-04-08 (per user environment).
+
+================================================================================
+STEP 1 — BROAD STRING AND ENTRY DISCOVERY (GHIDRA MCP)
+================================================================================
+
+Action:
+  - list_strings(filter="pass", limit=2000, offset=0)
+  - list_strings(filter="shutdown", limit=2000, offset=0)
+  - list_strings(filter="kill", limit=2000, offset=0)
+  - search_functions_by_name(query="main", limit=50)
+
+Data read (pass filter):
+  0010204c: "Usage: %s <password>\n"
+
+Data read (shutdown filter):
+  (no matching program strings returned)
+
+Data read (kill filter):
+  (no matching program strings returned)
+
+Data read (main search):
+  __libc_start_main @ 00105000
+
+Interpretation:
+  - The only user-facing "pass" hint is a printf-style usage string requiring
+    a password as an argument. No literal "shutdown" or "kill" strings in the
+    same search window suggested an overt kill-switch label; the secret is
+    framed as argv[1].
+  - Standard libc startup implies a custom entry that eventually calls the
+    authored main-like routine (not necessarily named "main" in the symbol table).
+
+Why this step:
+  - Fast triage: strings often reveal CLI usage, hardcoded messages, and keys.
+  - Ruled out obvious string matches for "shutdown"/"kill" while locating the
+    password usage pattern.
+
+================================================================================
+STEP 2 — PROGRAM STRINGS LIST (GHIDRA MCP, UNFILTERED WINDOW)
+================================================================================
+
+Action:
+  - list_strings(filter="password", limit=2000, offset=0)
+  - list_strings(limit=500, offset=0)
+  - get_xrefs_to(address="0x0010204c", limit=50)
+
+Data read (password filter):
+  0010204c: "Usage: %s <password>\n"
+
+Data read (partial listing from limit=500):
+  00102004: "/proc"
+  0010200a: "/proc/%s/comm"
+  0010201a: "You achieved Level 7!"
+  00102030: "Sorry, not quite there yet."
+  0010204c: "Usage: %s <password>\n"
+  Plus standard ELF section names and dynamic linker paths.
+
+Data read (xrefs to 0x0010204c — the usage string):
+  From 00101ea1 in FUN_00101e47 [DATA]
+  From 00101eab in FUN_00101e47 [PARAM]
+
+Interpretation:
+  - Success/failure messages frame the binary as a "level" challenge; still,
+    logically equivalent to "correct password" vs "wrong password."
+  - All references to the usage format string lie in FUN_00101e47; that function
+    implements argument parsing and the user-visible branch for wrong argc.
+
+Why this step:
+  - Confirms data/code linkage: the password prompt is not dead rodata; it is
+    reached from one function — the right place to start decompilation.
+
+================================================================================
+STEP 3 — CUTTER MCP (PARALLEL SANITY CHECK)
+================================================================================
+
+Action:
+  - search_functions_by_name(query="main", limit=20)
+
+Data read:
+  (empty / no results returned in this session)
+
+Interpretation:
+  - Cutter MCP did not surface a "main" name hit in the constrained query; the
+    work continued from Ghidra, which had already identified FUN_00101e47 from
+    xrefs. Cutter would still point to the same addresses if the binary is the
+    same image.
+
+Why this step:
+  - User requested use of both tools where helpful; this was a quick cross-tool
+    check. Absence of results did not block progress because Ghidra had a clear xref.
+
+================================================================================
+STEP 4 — DECOMPILE CLI HANDLER (GHIDRA, THEN CUTTER)
+================================================================================
+
+Action:
+  - decompile_function_by_address(address="0x00101e47")  [Ghidra]
+  - decompile_function_by_address(address="0x00101e47")  [Cutter]
+
+Data read (Ghidra decompilation, summarized):
+  FUN_00101e47(int param_1, undefined8 *param_2):
+    if (param_1 == 2) {
+      local_c = FUN_00101d1d(param_2[1]);
+      if (local_c == 1) puts("You achieved Level 7!");
+      else puts("Sorry, not quite there yet.");
+    } else {
+      printf("Usage: %s <password>\n", *param_2);
+    }
+    return local_c;
+
+Data read (Cutter):
+  No substantive decompilation text returned in this session (tool output empty).
+
+Interpretation:
+  - param_1 is argc; param_2 is argv. The password is argv[1], passed to
+    FUN_00101d1d.
+  - Return value of FUN_00101d1d is treated as boolean success (1 = success).
+
+Why this step:
+  - Reduces the problem to reverse engineering a single predicate on the
+    password string inside FUN_00101d1d.
+
+================================================================================
+STEP 5 — DECOMPILE PASSWORD VALIDATION (FUN_00101d1d)
+================================================================================
+
+Action:
+  - decompile_function_by_address(address="0x00101d1d")  [Ghidra and Cutter]
+
+Data read (Ghidra pseudocode, structure):
+  - Stack buffer local_68[48]; many single-byte locals local_38 down to local_d.
+  - Assigns 43 bytes (0x2b) of constant values into locals local_38..local_d
+    (see numeric list in step 6).
+  - Order of checks:
+      iVar1 = FUN_00101cc9();
+      if ((iVar1 == 0) && (iVar1 = FUN_00101493(), iVar1 == 0)) {
+        memcpy(local_68, param_1, 0x2b);
+        FUN_001012e8(local_68, 0x2b, 0x1122334455667788);
+        iVar1 = memcmp(local_68, &local_38, 0x2b);
+        return iVar1 == 0;
+      }
+      return false;
+
+Interpretation:
+  - FUN_00101cc9 and FUN_00101493 are gates: both must return "0"/false for the
+    memcmp path to run. That implies anti-analysis or anti-debug (see step 8).
+  - User input length enforced indirectly: memcpy copies 43 bytes from the
+    user pointer (may read past C string end if shorter — undefined behavior in
+    C; in practice the compared ciphertext encodes a 43-byte exact match).
+  - FUN_001012e8 mutates local_68 in place using the 64-bit constant
+    0x1122334455667788 as key material.
+  - memcmp against embedded bytes means:
+      transform(user_password) == embedded_ciphertext
+    Therefore:
+      user_password = inverse_transform(embedded_ciphertext)
+    if the transform is XOR with a deterministic keystream (it is).
+
+Why this step:
+  - Isolates ciphertext, length (0x2b), key constant, and transform call site.
+
+================================================================================
+STEP 6 — EXPLICIT CIPHERTEXT BYTES (FROM GHIDRA LOCAL INITIALIZERS)
+================================================================================
+
+Source: FUN_00101d1d decompiler listing of assignments (hex bytes).
+
+Order interpreted as contiguous memcmp starting at &local_38, first assigned
+byte first (standard Ghidra stack ordering for this listing):
+
+  Index: hex
+  -----: ---
+   0: b7   1: 5f   2: f3   3: 97   4: f2   5: e2   6: 9b   7: b8
+   8: 81   9: 6c  10: f1  11: d7  12: c7  13: 0d  14: c4  15: 11
+  16: 72  17: 1e  18: 48  19: 89  20: ea  21: 83  22: a5  23: 6b
+  24: de  25: 43  26: 70  27: 4a  28: 39  29: 5c  30: 0a  31: 1a
+  32: 76  33: 3c  34: 9d  35: d3  36: 7e  37: 42  38: a2  39: 4d
+  40: e0  41: 9d  42: 44
+
+Note: Ghidra also showed another 0xc7 (decimal 199) assigned to local_d in a
+longer listing; memcmp length is exactly 0x2b (43). The ciphertext used for
+recovery included 43 bytes as above (ending at 0x44), consistent with memcmp.
+
+Interpretation:
+  - Fixed target digest after the stream XOR; acts like a ciphertext or MAC
+    check without a separate hash API import.
+
+================================================================================
+STEP 7 — DECOMPILE TRANSFORM FUN_001012e8 AND CORE MIX FUN_00101219
+================================================================================
+
+Action:
+  - decompile_function_by_address(address="0x001012e8")
+  - decompile_function_by_address(address="0x00101219")
+
+Data read — FUN_001012e8 (conceptual):
+  - Splits param_3 = 0x1122334455667788 into eight bytes in big-endian order:
+      11 22 33 44 55 66 77 88
+  - Packs into two 32-bit words for the mixer:
+      key_word0 = 0x11223344, key_word1 = 0x55667788
+  - Maintains uint64 counter local_10 starting at 0; after each 8-byte block,
+    local_10 increments by 1.
+  - For each block offset local_14 = 0, 8, 16, ... while local_14 < param_2:
+      * Split local_10 into high and low 32-bit halves -> array local_40[0], [1]
+      * Call FUN_00101219(local_40, &(local_40[2]))  // mixes [0],[1] using keys
+      * For local_18 in 0..7 while in range of param_2:
+          Extract one byte from local_40[0] or local_40[1] in big-endian
+          per-word order (4 bytes per word).
+          data[local_14 + local_18] ^= keystream_byte
+
+Data read — FUN_00101219 (conceptual):
+  - 32 iterations (0x20). Each iteration:
+      accumulator += -0x61C88647   (unsigned 32-bit wrap; same as subtracting
+                                    0x61C88647, a common LCg/TEA-style delta)
+      Update two 32-bit state words with XOR/add/shift mixes against key words
+      read from param_2 (and adjacent stack — effectively key words duplicated).
+
+Interpretation:
+  - Overall structure: block counter -> 32-round Feistel-like mixing -> 8-byte
+    keystream chunk -> XOR with payload. Same keystream for encryption and
+    decryption (XOR property).
+  - Password recovery reduces to implementing this keystream generator and
+    XORing ciphertext bytes.
+
+Why:
+  - memcmp is on transformed input; XOR stream means plaintext = cipher XOR ks.
+
+================================================================================
+STEP 8 — ANTI-ANALYSIS ROUTINES (CONTEXT FOR RUNNING THE BINARY)
+================================================================================
+
+Action:
+  - decompile_function_by_address(address="0x00101cc9")
+  - decompile_function_by_address(address="0x00101493")
+
+Data read — FUN_00101cc9:
+  - Uses ptrace(PTRACE_TRACEME). If ptrace does NOT return -1, calls DETACH.
+  - Returns true when lVar1 == -1 (debugger path) — exact tri-state semantics
+    must match the caller's expectation: the outer condition required
+    FUN_00101cc9() == 0 first for success path.
+
+Data read — FUN_00101493:
+  - Iterates /proc, reads /proc/<pid>/comm, compares against names including:
+    gdb, lldb, radare2, ida64, cutter, strace, ltrace, valgrind, binaryninja,
+    and a short obfuscated/constructed name (edb-related bytes in decompilation).
+
+Interpretation:
+  - Even with the mathematically correct password, execution may fail validation
+    when run under a debugger or when tracer processes appear in /proc.
+  - Static recovery of the password remains valid; dynamic verification may
+    require a clean environment or patched checks.
+
+================================================================================
+STEP 9 — PYTHON REIMPLEMENTATION AND RECOVERY
+================================================================================
+
+Action:
+  - Implemented in Python (outside MCP):
+      * KEY words: k0=0x11223344, k1=0x55667788
+      * For block index n in 0..: build v0,v1 from 64-bit counter n
+        (high 32 / low 32)
+      * Run 32-round update matching C operator precedence for +, ^, shifts:
+          term structure per Ghidra:
+          new_v0 += ( (k1 + (v1>>5)) ^ (v1*0x10 + k0) ^ (r + v1) )
+          new_v1 += ( (k3 + (v0>>5)) ^ (v0*0x10 + k2) ^ (r + v0) )
+        with k2=k0, k3=k1 and r updating each round by r = (r - 0x61C88647) mod 2^32
+      * Extract 8 big-endian bytes from resulting v0,v1
+      * XOR with ciphertext bytes for that block
+  - Applied to all 43 bytes (last partial block 3 bytes).
+
+Data read (program output from script):
+  len expected 43
+  password bytes: b'flag_{Lin7_EBFE_N0w_tH4t$_@_K3wL_n3W_Tr1cK!'
+  ascii: flag_{Lin7_EBFE_N0w_tH4t$_@_K3wL_n3W_Tr1cK!
+
+Interpretation:
+  - Produces a printable ASCII flag-style password of length 43, matching 0x2b.
+  - Consistent with "Level 7" theme (Lin7 in the flag).
+
+Why:
+  - Algebraic inversion is cheaper than brute force and confirms understanding
+    of the transform.
+
+================================================================================
+FINAL ANSWER (RECOVERED PASSWORD)
+================================================================================
+
+  flag_{Lin7_EBFE_N0w_tH4t$_@_K3wL_n3W_Tr1cK!
+
+Suggested verification (clean environment, no blocking checks):
+  ./<binary_name> 'flag_{Lin7_EBFE_N0w_tH4t$_@_K3wL_n3W_Tr1cK!'
+
+================================================================================
+SUMMARY OF MCP TOOLS USED
+================================================================================
+
+Ghidra MCP:
+  - list_strings (multiple filters)
+  - search_functions_by_name
+  - get_xrefs_to
+  - decompile_function_by_address (FUN_00101e47, FUN_00101d1d, FUN_001012e8,
+    FUN_00101219, FUN_00101cc9, FUN_00101493)
+
+Cutter MCP:
+  - search_functions_by_name (limited result)
+  - decompile_function_by_address (no output in session for listed addresses)
+
+Local computation:
+  - Python 3 script reproducing keystream + XOR inversion
+
+================================================================================
+END OF LOG
+================================================================================

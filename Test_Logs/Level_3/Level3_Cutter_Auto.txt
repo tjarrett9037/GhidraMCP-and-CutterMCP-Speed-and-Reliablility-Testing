@@ -1,0 +1,247 @@
+RANSOMWARE PASSWORD RECOVERY - FULL STEP LOG
+Date: 2026-04-07
+Analyst: Cursor Agent (Cutter MCP)
+Target binary loaded in Cutter: /home/kali/Documents/MCPTesting/Test_Files/Working_files/CutterMCP_Solves/Lin3_2026
+
+============================================================
+1) OBJECTIVE
+============================================================
+User request: Find a password inside the loaded ransomware sample that can shut down malware behavior.
+
+Strategy used:
+- Start with high-signal metadata (imports/exports/symbol names).
+- If stripped/static (low symbols), enumerate functions.
+- Locate suspicious routines (password compare/deobfuscation).
+- Reverse the transform and decode candidate secret.
+- Confirm password value format and null terminator behavior.
+
+============================================================
+2) COMPLETE CHRONOLOGICAL STEPS, DATA READ, INTERPRETATION, WHY
+============================================================
+
+STEP 1: List imports, likely function names, and exports.
+Tools called:
+- user-cutter-list_imports(offset=0, limit=200)
+- user-cutter-search_functions_by_name(query="pass")
+- user-cutter-search_functions_by_name(query="shut")
+- user-cutter-search_functions_by_name(query="kill")
+- user-cutter-list_exports(offset=0, limit=200)
+
+Raw data read:
+- Imports output header only:
+  "nth vaddr bind type lib name"
+  "-----------------------------"
+- search_functions_by_name("pass") => no results
+- search_functions_by_name("shut") => no results
+- search_functions_by_name("kill") => no results
+- Exports output header only:
+  "nth paddr vaddr bind type size lib name"
+  "----------------------------------------"
+
+Interpretation:
+- No meaningful imports/exports/symbol names are present.
+- String-based name hunting fails (likely stripped binary and/or static linkage).
+
+Why this step:
+- Fast triage. If symbol names exist, password checks are often quickly found via names like strcmp/check_pass/shutdown.
+
+
+STEP 2: Enumerate discovered functions to understand analysis surface.
+Tool called:
+- user-cutter-list_functions(offset=0, limit=300)
+
+Raw data read (as returned):
+- Long address list, mostly unnamed auto-labels like:
+  0x00401000 fcn.00401000
+  0x00401018 fcn.00401018
+  ...
+  0x0043e5d0 fcn.0043e5d0
+- Includes entrypoint label:
+  0x00401600 entry0
+
+Interpretation:
+- Binary has many functions and is heavily stripped.
+- Need to pivot from entrypoint and structural runtime flow.
+
+Why this step:
+- Establish candidate starting points when symbol names are absent.
+
+
+STEP 3: Confirm binary characteristics and compiler/runtime clues.
+Tools called:
+- user-cutter-search_functions_by_name(query="main")
+- user-cutter-search_functions_by_name(query="runtime")
+- user-cutter-show_headers(offset=0, limit=120)
+
+Raw data read:
+- search("main") => no results
+- search("runtime") => no results
+- Header details included (key fields):
+  file     /home/kali/Documents/MCPTesting/Test_Files/Working_files/CutterMCP_Solves/Lin3_2026
+  format   elf64
+  type     EXEC
+  arch     x86-64
+  os       linux
+  stripped true
+  static   true
+  NX       true
+  PIE      false
+  Entrypoint 0x00401600
+  compiler GCC: (Debian 15.2.0-7) 15.2.0
+
+Interpretation:
+- This is a stripped static ELF64 executable.
+- Lack of symbols/import richness is expected.
+- Entrypoint-based analysis is appropriate.
+
+Why this step:
+- Needed to explain earlier lack of symbol/search signal and choose proper reverse path.
+
+
+STEP 4: Map sections/segments to identify code/data zones.
+Tool called:
+- user-cutter-list_segments(offset=0, limit=100)
+
+Raw data read (important entries):
+- .text   at 0x00401100 size 0x751b9 (execute)
+- .rodata at 0x00477000 size 0x1bbac (read-only constants)
+- .data   at 0x004a40c0 size 0x1a00
+- .bss    at 0x004a5ac0 vsize 0x5808
+
+Interpretation:
+- Confirms conventional code/constant layout.
+- Suggests static string/byte arrays likely in data/stack setup routines.
+
+Why this step:
+- Prepare for tracing compare logic and possible embedded encoded strings.
+
+
+STEP 5: Decompile/disassemble entrypoint and startup driver.
+Tools called:
+- user-cutter-disassemble_function(address=0x00401600)
+- user-cutter-decompile_function_by_address(address=0x00401600)
+- user-cutter-show_function_detail(address=0x00401600)
+
+Raw data read:
+- entry0 sets up args then calls fcn.00403e00 with first arg = 0x40185f.
+- Then executes HLT/infinite dead-end pattern typical of CRT handoff.
+
+Interpretation:
+- Real program control transfers to fcn.00403e00.
+
+Why this step:
+- Establish first meaningful control transfer for deeper analysis.
+
+
+STEP 6: Analyze fcn.00403e00 (startup/runtime dispatcher).
+Tools called:
+- user-cutter-disassemble_function(address=0x00403e00)
+- user-cutter-decompile_function_by_address(address=0x00403e00)
+
+Raw data read (critical points from output):
+- Function performs relocation/runtime init, constructor calls, and then eventually calls fcn.00401dc0(arg1,arg2,arg3).
+- Entry had passed 0x40185f as arg1 into this chain.
+
+Interpretation:
+- fcn.00403e00 behaves like static runtime startup wrapper.
+- The passed pointer 0x40185f is likely the real program main/handler function pointer.
+
+Why this step:
+- Identify where real malware logic begins and where password checks may be used.
+
+
+STEP 7: Inspect nearby suspicious function with explicit string compare pattern.
+Tools called:
+- user-cutter-disassemble_function(address=0x0040176f)
+- user-cutter-decompile_function_by_address(address=0x0040176f)
+
+Raw data read:
+- Local byte array initialized byte-by-byte with values:
+  0x85, 0x8f, 0x82, 0x84, 0xbc, 0x98, 0xaf, 0x8a, 0x8d, 0xd0,
+  0xbc, 0xbb, 0xac, 0xb1, 0xbc, 0xd0, 0x8d, 0xa0, 0x91, 0x9a,
+  0x93, 0xc8, 0xd2, 0xd3, 0x8d, 0xbc, 0x8a, 0xc7, 0xbc, 0xad,
+  0x8c, 0xbc, 0x93, 0x91, 0xac, 0x81, 0xaf, 0xd0, 0x8e, 0xc2,
+  0x9e, 0xe3, 0x00
+- Calls fcn.00401725(buffer, 0x2b, 0xffffffe3)
+- Then calls fcn.00401098(user_input, decoded_buffer)
+- Returns true if compare result == 0 (i.e., strings equal)
+
+Interpretation:
+- This is a canonical password-check routine:
+  (1) encoded bytes
+  (2) decode transform
+  (3) strcmp-like equality check
+- Length argument 0x2b = 43 bytes decoded.
+- Key byte from 0xffffffe3 -> 0xE3.
+
+Why this step:
+- This directly matched expected secret validation behavior.
+
+
+STEP 8: Reverse the decoder transform function.
+Tools called:
+- user-cutter-disassemble_function(address=0x00401725)
+- user-cutter-decompile_function_by_address(address=0x00401725)
+- user-cutter-xrefs_to(address=0x0040176f)
+
+Raw data read:
+- fcn.00401725 loops i=0..len-1 and does:
+  buffer[i] = buffer[i] XOR (uint8_t)arg3
+- xrefs_to(0x0040176f):
+  (nofunc) 0x401882 [CALL] call fcn.0040176f
+
+Interpretation:
+- Decoder is simple XOR with single-byte key.
+- Existing caller confirms this check is actually used by program flow.
+
+Why this step:
+- Needed exact mathematical transform before extracting password.
+
+
+STEP 9: Decode bytes externally to avoid manual mistakes.
+Tool called:
+- Shell: python3 snippet applying XOR 0xE3 to each byte
+
+Python used:
+- arr=[...obfuscated bytes...]
+- print(''.join(chr(b^0xE3) for b in arr))
+
+Raw output read:
+- flag_{Lin3_XOR_3nCryp+10n_i$_No_prObL3m!}\x00
+
+Interpretation:
+- Printable password is:
+  flag_{Lin3_XOR_3nCryp+10n_i$_No_prObL3m!}
+- Trailing null is string terminator, not part of typed password.
+
+Why this step:
+- Produces exact, verified plaintext from encoded bytes.
+
+
+STEP 10: Final answer delivered to user.
+Result provided:
+- `flag_{Lin3_XOR_3nCryp+10n_i$_No_prObL3m!}`
+- Explained null-terminator handling.
+
+============================================================
+3) HOW EACH CRITICAL DATA POINT MAPPED TO CONCLUSION
+============================================================
+- "stripped true" + "static true" => no reliance on symbols/imports.
+- entry0 -> fcn.00403e00 => runtime init path.
+- fcn.0040176f stack byte constants + decode + compare => password validator.
+- fcn.00401725 XOR loop => exact deobfuscation method.
+- Python decode output => final literal password.
+
+============================================================
+4) CONFIDENCE
+============================================================
+High confidence.
+Reason:
+- The function behavior is explicit and deterministic.
+- Comparison is direct equality check after decode.
+- Decoded text has CTF-style format and null-terminated string semantics.
+
+============================================================
+5) IMPORTANT SAFETY NOTE
+============================================================
+This log documents reverse engineering to recover a kill-switch/shutdown credential from a ransomware sample. Use only in authorized malware analysis/incident response contexts.

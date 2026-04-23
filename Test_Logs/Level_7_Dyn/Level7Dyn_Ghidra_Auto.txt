@@ -1,0 +1,191 @@
+Level 7 Malware Password Recovery Log
+Date: 2026-03-31
+Analyst: Cursor AI Agent (Ghidra MCP-assisted)
+Objective: Identify the "shutdown password" / accepted password embedded in the sample.
+
+==================================================
+1) Initial Strategy
+==================================================
+I started with a string- and control-flow-based triage strategy:
+- Find candidate strings related to password handling and shutdown behavior.
+- Trace xrefs from those strings to the function that validates user input.
+- Reverse the validation routine to recover the expected plaintext input.
+
+Reasoning:
+- Most challenge malware/ransomware binaries expose at least one usage/help string and parse argv.
+- A usage string like "<password>" usually points directly to the password check path.
+
+==================================================
+2) Ghidra MCP Queries and Raw Data Read
+==================================================
+
+Step 2.1 - Get current location context
+Tool call: get_current_function()
+Returned data:
+- Function: entry at 00101130
+- Signature: undefined processEntry entry(void)
+
+Interpretation:
+- Current function is the ELF entry stub; real logic is likely reached via __libc_start_main.
+
+Step 2.2 - Get current address
+Tool call: get_current_address()
+Returned data:
+- 00101130
+
+Interpretation:
+- Confirms cursor focus at entry.
+
+Step 2.3 - Search strings containing "pass"
+Tool call: list_strings(filter="pass", limit=2000)
+Returned data:
+- 0010204c: "Usage: %s <password>\n"
+
+Interpretation:
+- Strong indicator of a CLI argument-based password check path.
+- This is the highest-confidence pivot point.
+
+Step 2.4 - Search strings containing "shutdown", "stop", "kill", "ransom", "decrypt"
+Tool calls:
+- list_strings(filter="shutdown")
+- list_strings(filter="stop")
+- list_strings(filter="kill")
+- list_strings(filter="ransom")
+- list_strings(filter="decrypt")
+Returned data:
+- No relevant matches returned.
+
+Interpretation:
+- No explicit shutdown/kill-switch text present; likely obfuscated or challenge-style validation only.
+- Continue with xref tracing from the usage string.
+
+Step 2.5 - Cross-references to usage string
+Tool call: get_xrefs_to(address="0x0010204c", limit=20)
+Returned data:
+- From 00101ea1 in FUN_00101e47 [DATA]
+- From 00101eab in FUN_00101e47 [PARAM]
+
+Interpretation:
+- Function FUN_00101e47 is likely main() or main-like wrapper handling argv.
+
+Step 2.6 - Decompile entry function
+Tool call: decompile_function_by_address("0x00101130")
+Returned data (key points):
+- processEntry entry(...) calls __libc_start_main(FUN_00101e47, ...)
+
+Interpretation:
+- Confirms FUN_00101e47 is the actual main-like routine.
+
+Step 2.7 - Decompile FUN_00101e47
+Tool call: decompile_function_by_address("0x00101e47")
+Returned data (key points):
+- if (argc == 2) { local_c = FUN_00101d1d(argv[1]); ... }
+- else printf("Usage: %s <password>\n", argv[0]);
+- prints success text when return == 1:
+  "You achieved Level 7!"
+
+Interpretation:
+- Password candidate must satisfy FUN_00101d1d(input) == true.
+- This function is the direct password verifier.
+
+Step 2.8 - Decompile verifier FUN_00101d1d
+Tool call: decompile_function_by_address("0x00101d1d")
+Returned data (critical observations):
+- Defines 43-byte constant byte array in locals:
+  b7 5f f3 97 f2 e2 9b b8 81 6c f1 d7 c7 0d c4 11
+  72 1e 48 89 ea 83 a5 6b de 43 70 4a 39 5c 0a 1a
+  76 3c 9d d3 7e 42 a2 4d e0 9d 44
+- Calls anti-analysis checks:
+  iVar1 = FUN_00101cc9();          // ptrace anti-debug
+  if (iVar1 == 0) iVar1 = FUN_00101493(); // process-name anti-analysis
+- On passing anti-analysis:
+  memcpy(local_68, input, 0x2b);
+  FUN_001012e8(local_68, 0x2b, 0x1122334455667788);
+  return memcmp(local_68, &local_38, 0x2b) == 0;
+
+Interpretation:
+- Input length effectively expected as 0x2b (43) bytes.
+- Verifier transforms the input with FUN_001012e8 and compares result to embedded 43-byte target.
+- Therefore target bytes are transformed(ciphertext-like) output; plaintext password can be recovered by inverting/replicating transform.
+
+Step 2.9 - Decompile transform function FUN_001012e8
+Tool call: decompile_function_by_address("0x001012e8")
+Returned data (key logic):
+- Builds 8-byte key stream seed from 64-bit constant 0x1122334455667788.
+- Repackages into two 32-bit words.
+- Loops over data in 8-byte chunks.
+- For each chunk:
+  - sets block from 64-bit counter (high32, low32)
+  - calls FUN_00101219(block, key_words)
+  - XORs resulting 8-byte keystream into data bytes
+  - increments counter
+
+Interpretation:
+- This is stream-style XOR encryption: data ^= keystream(counter, key).
+- To recover plaintext from known transformed bytes, apply same XOR keystream again.
+
+Step 2.10 - Decompile round function FUN_00101219
+Tool call: decompile_function_by_address("0x00101219")
+Returned data (key logic):
+- 32 rounds with delta constant pattern -0x61c88647 (equivalent TEA delta progression).
+- Mixes two 32-bit words with 4-word key schedule.
+
+Interpretation:
+- TEA-like block function generating per-counter keystream blocks.
+
+Step 2.11 - Decompile anti-debug function FUN_00101cc9
+Tool call: decompile_function_by_address("0x00101cc9")
+Returned data:
+- Calls ptrace(PTRACE_TRACEME,...), returns true if ptrace failed (-1).
+
+Interpretation:
+- Standard anti-debug check. Important to understand runtime behavior, but not needed to recover static password.
+
+Step 2.12 - Decompile anti-tool process scan FUN_00101493
+Tool call: decompile_function_by_address("0x00101493")
+Returned data (key logic):
+- Enumerates /proc/<pid>/comm and compares process names against:
+  gdb, lldb, radare2, ida64, cutter, strace, ltrace, valgrind, binaryninja, edb
+
+Interpretation:
+- Another anti-analysis gate that can block success path at runtime.
+- Again not needed for static derivation, but explains false negatives if user tests under debugger.
+
+==================================================
+3) Offline Reconstruction Performed
+==================================================
+
+Step 3.1 - Re-implemented transform in Python exactly as decompiled
+Method:
+- Implement TEA-like round function equivalent to FUN_00101219.
+- Build key words from 0x1122334455667788 in big-endian byte order as done in FUN_001012e8.
+- Generate keystream blocks from counter values 0,1,2,...
+- XOR keystream with the 43-byte embedded target array from FUN_00101d1d.
+
+Why:
+- Because verifier compares transform(input) to target bytes.
+- Since operation is XOR with deterministic keystream, input = target XOR same keystream.
+
+Step 3.2 - Raw script output
+Terminal output:
+- b'flag_{Lin7_EBFE_N0w_tH4t$_@_K3wL_n3W_Tr1cK!'
+- ascii? True
+- repr flag_{Lin7_EBFE_N0w_tH4t$_@_K3wL_n3W_Tr1cK!
+
+Interpretation:
+- Clean printable ASCII CTF-style token.
+- Correct length (43 bytes), matching verifier copy/compare size 0x2b.
+- Fits all observed constraints.
+
+==================================================
+4) Final Result
+==================================================
+Recovered password:
+flag_{Lin7_EBFE_N0w_tH4t$_@_K3wL_n3W_Tr1cK!
+
+Confidence:
+- High (deterministically derived from exact verifier logic and embedded bytes).
+
+Operational note:
+- If execution still fails despite correct password, anti-debug/process checks in FUN_00101cc9/FUN_00101493 may be triggering due to analysis tools running.
+

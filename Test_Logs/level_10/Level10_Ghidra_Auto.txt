@@ -1,0 +1,246 @@
+Level 10 (ransomware sample) - Full Recovery Process Log
+Date: 2026-03-31
+Analyst: Cursor AI assistant session
+Goal: Find shutdown/auth password embedded in loaded malware sample.
+
+====================================================================
+1) Initial hypothesis and triage strategy
+====================================================================
+I started from your hypothesis: there is likely a password that the binary checks.
+My initial strategy:
+1. Identify obvious password-related strings.
+2. Trace xrefs from those strings into code.
+3. Decompile candidate checker functions.
+4. Recover compare logic and derive expected input.
+5. Validate recovered password by executing sample with candidate argument.
+
+Reasoning:
+- Fastest route in crackme/ransomware challenge binaries is often through usage/help strings and nearby compare code.
+- If plaintext password is not present, then decode/transform logic near comparison usually reveals it.
+
+====================================================================
+2) Ghidra string/import reconnaissance
+====================================================================
+Tool calls:
+- list_strings(filter="pass")
+- list_strings(filter="shutdown")
+- list_strings(filter="ransom")
+- list_imports()
+- get_current_function()
+
+Raw relevant data observed:
+- 0x004780b1: "Usage: %s <password>\n"
+- get_current_function -> entry at 0x00401660
+- "shutdown"/"ransom" filters did not return meaningful malware-specific strings.
+
+Interpretation:
+- The "Usage: %s <password>" string is a strong indicator that program expects one argument and validates it.
+- No obvious hardcoded plaintext password in strings, so likely transformed/encrypted verification.
+
+Why this mattered:
+- Established primary pivot point (usage string address 0x004780b1).
+
+====================================================================
+3) Cross-reference from usage string to argument-check function
+====================================================================
+Tool calls:
+- get_xrefs_to(0x004780b1)
+- decompile_function_by_address(0x00402659)
+
+Raw relevant data observed:
+- Xrefs from 0x004026bd and 0x004026c7 in FUN_00402659.
+- Decompiled FUN_00402659 showed:
+  - if argc == 2:
+      iVar1 = FUN_004023fe(argv[1]);
+      if iVar1 == 1 => "You achieved Level 10!"
+      else => "Sorry, not quite there yet."
+  - else print usage string.
+
+Interpretation:
+- FUN_004023fe is the real password checker.
+- Successful validation returns 1.
+
+Why this mattered:
+- Narrowed problem to reversing FUN_004023fe and helper routines it invokes.
+
+====================================================================
+4) Decompile the checker and identify transformation chain
+====================================================================
+Tool calls:
+- decompile_function_by_address(0x004023fe)
+- decompile_function_by_address(0x004019f4)
+- decompile_function_by_address(0x0040186e)
+- decompile_function_by_address(0x0040193d)
+- decompile_function_by_address(0x004017d9)
+
+Raw relevant data observed in FUN_004023fe:
+- Populates local byte array acStack_78 with 0x34 (=52) fixed bytes:
+  A7 48 C5 4A 82 CE 94 26 69 D3 52 8A 97 C0 F1 3A
+  1F 9A 04 9B 44 31 18 CF 55 B5 25 8A 94 EB DB 85
+  74 A4 02 DC 65 67 15 DF C7 43 91 2C EE 8D DC 3E
+  42 AE 76 80
+- Copies 52 bytes from input password into acStack_b8.
+- Calls FUN_004019f4(acStack_b8, 0x34, 0x123456789abcdef0).
+- Compares transformed acStack_b8[i] against acStack_78[i] for all 52 bytes.
+- Returns 1 only if all bytes match.
+
+Helper interpretation:
+- FUN_004019f4:
+  - Builds 8-byte key from constant 0x123456789abcdef0.
+  - Calls FUN_0040193d to create round keys from DAT_00478020.
+  - Generates per-block keystream with counter and FUN_0040186e.
+  - XORs keystream into input bytes (stream/CTR-like transform).
+- FUN_0040186e:
+  - 16-round Feistel-like structure, close to Blowfish block processing.
+- FUN_0040193d:
+  - Initializes table from DAT_00478020 then xors in key material.
+- FUN_004017d9:
+  - F-function using table DAT_004a6b20.
+
+Why this mattered:
+- Confirmed password is not compared directly; it is transformed then matched to fixed ciphertext-like bytes.
+- Required reproducing transform to recover plaintext.
+
+====================================================================
+5) First decode attempts and correction loop
+====================================================================
+I attempted external reimplementation using Python.
+
+Attempt A:
+- Used PyCryptodome (`from Crypto.Cipher import Blowfish`).
+- Failed with ModuleNotFoundError: No module named 'Crypto'.
+
+Interpretation:
+- Environment lacked PyCryptodome.
+
+Attempt B:
+- Checked `cryptography` package availability.
+- Result: "ok" (available).
+
+Attempt C:
+- Used standard Blowfish ECB to generate CTR keystream (big/little-endian counter tries).
+- XOR with 52-byte target buffer.
+- Output remained non-printable/no obvious flag text.
+
+Interpretation:
+- This binary is not using plain library Blowfish state directly.
+- Need to replicate its exact custom F/round/key schedule behavior as decompiled, not textbook assumptions.
+
+====================================================================
+6) Additional static/dynamic support data read
+====================================================================
+I also consumed supporting artifacts available on disk from prior debugging attempts:
+- /home/kali/gdb_path.txt
+- /home/kali/gdb_cmds.txt
+- /home/kali/gdb_dyn_map.txt
+- /home/kali/gdb_static_map.txt
+- /home/kali/gdb_static_map2.txt
+- /home/kali/gdb_static_map3.txt
+- /home/kali/gdb_static_map4.txt
+
+What these contained:
+- GDB scripts with breakpoints around checker addresses:
+  0x402523, 0x402530, 0x40259e, 0x402615, 0x402657 (or PIE-shifted equivalents).
+- Commands intended to force anti-debug checks and dump mapping:
+  "MAP in_idx=... t_idx=... in=0x.. tgt=0x.."
+
+Interpretation:
+- These files confirmed prior investigation targeted the same function and compare loop.
+- They were useful context for runtime extraction approach, but did not yet contain completed output mapping in file contents themselves.
+
+Why this mattered:
+- Validated address landmarks and anti-debug bypass points.
+- Helped cross-check checker structure seen in decompiler.
+
+====================================================================
+7) Disassembly and data-table confirmation
+====================================================================
+Tool calls:
+- disassemble_function(0x004023fe)
+- list_data_items(limit=300)
+- shell: xxd -g 4 -s 0x78020 -l 0x48 <binary>
+
+Key raw data:
+- Disassembly confirmed critical instruction-level behavior and byte loads into target array.
+- list_data_items showed DAT_00478020 region and usage string at 0x004780b1.
+- xxd dump at 0x78020 produced 18 32-bit constants:
+  243F6A88 85A308D3 13198A2E 03707344 A4093822 299F31D0
+  082EFA98 EC4E6C89 452821E6 38D01377 BE5466CF 34E90C6C
+  C0AC29B7 C97C50DD 3F84D5B5 B5470917 9216D5D9 8979FB1B
+
+Interpretation:
+- DAT_00478020 is the Blowfish-like P-array seed (looks like canonical Blowfish constants).
+- Confirms custom implementation seeded from these constants then modified by key material.
+
+Why this mattered:
+- Enabled exact reimplementation of transform pipeline.
+
+====================================================================
+8) Runtime extraction attempt (GDB) and constraint
+====================================================================
+Action:
+- I wrote /home/kali/gdb_auto_extract.txt to automate breakpoints + map logging.
+- Ran it with gdb -batch.
+
+Observed output:
+- Breakpoints set, but warnings:
+  "opening /proc/self/mem file failed: Permission denied (13)"
+  "opening /proc/PID/mem file ... Permission denied (13)"
+- Program still executed and printed failure line.
+- No MAP lines emitted in that environment.
+
+Interpretation:
+- Runtime introspection was restricted in this execution context; static reconstruction remained primary path.
+
+Why this mattered:
+- Confirmed I should finish through deterministic static emulation instead of waiting on debugger memory access.
+
+====================================================================
+9) Final successful reconstruction of transform
+====================================================================
+I corrected the Python model to match decompiled arithmetic exactly:
+- Proper 8-byte key folding behavior in FUN_0040193d key XOR loop.
+- Correct F-function operator precedence/order as seen in FUN_004017d9 equivalent logic.
+- Correct 16-round Feistel swap pattern and post-whitening.
+- Counter blocks processed in 8-byte chunks and XORed with 52-byte target.
+
+Decoded plaintext result:
+flag_{Lin10_Wh4t?_Anti-d!$4$$3mBLy_15_@_R3al_Th!ng?}
+
+Interpretation:
+- This is the required password/flag string for success path.
+
+====================================================================
+10) Validation against live binary
+====================================================================
+Execution checks:
+1) Command with double quotes:
+   "/path/Lin10_2026" "flag_{Lin10_Wh4t?_Anti-d!$4$$3mBLy_15_@_R3al_Th!ng?}"
+   Output: "Sorry, not quite there yet."
+
+Interpretation:
+- Shell expanded `$4` and `$$` inside double quotes, mutating argument.
+
+2) Command with single quotes:
+   '/path/Lin10_2026' 'flag_{Lin10_Wh4t?_Anti-d!$4$$3mBLy_15_@_R3al_Th!ng?}'
+   Output: "You achieved Level 10!"
+
+Interpretation:
+- Candidate is correct when passed literally.
+
+Final confirmed password:
+flag_{Lin10_Wh4t?_Anti-d!$4$$3mBLy_15_@_R3al_Th!ng?}
+
+====================================================================
+11) Why this methodology is reliable
+====================================================================
+Reliability indicators:
+- Control-flow proven from usage string xref -> main validator.
+- Validator behavior decompiled and disassembled consistently.
+- Target compare bytes recovered directly from checker local initialization.
+- Transform helpers analyzed to algorithmic level.
+- Candidate verified by actual program success message.
+
+Conclusion:
+- Password recovery is high confidence and execution-validated.
+

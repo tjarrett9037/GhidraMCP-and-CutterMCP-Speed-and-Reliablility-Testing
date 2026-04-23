@@ -1,0 +1,222 @@
+Ransomware Password Discovery Log
+Date: 2026-04-23
+Analyst: Codex (via Ghidra MCP tools)
+
+Purpose
+- Find the shutdown/validation password embedded in the loaded sample.
+- Record every step taken, what data was read, how it was interpreted, and why.
+
+============================================================
+1) Initial Triage Strategy
+============================================================
+Reasoning:
+- Password checks in C/C++ binaries are commonly discovered from:
+  1) user-facing strings ("usage", "password", success/failure messages),
+  2) cross-references to those strings,
+  3) nearby control flow and string-compare operations.
+
+Action:
+- Enumerate strings/imports/exports first.
+
+Tools used:
+- user-ghidra-list_strings(limit=2000)
+- user-ghidra-list_imports(limit=300)
+- user-ghidra-list_exports(limit=200)
+
+Data read (key observed content from very large output):
+- "Usage: %s <password>\n" at 0x00477042
+- "@@You achieved Level 3!" at 0x0047700e
+- "Sorry, not quite there yet." at 0x00477026
+- Export: entry -> 0x00401600
+- Imports output was empty in that call.
+
+Interpretation and why:
+- "Usage: %s <password>\n" strongly indicates argv-based password input.
+- Success/failure strings indicate a boolean gate after validation.
+- Therefore, next best step is to xref the usage string and decompile the caller.
+
+Notes on full strings output:
+- The list_strings output contained a large number of glibc/runtime strings unrelated to custom logic.
+- The three strings above were the immediately relevant high-signal artifacts.
+
+============================================================
+2) Locate Code Using the Password Usage String
+============================================================
+Action:
+- Find cross-references to 0x00477042.
+
+Tool used:
+- user-ghidra-get_xrefs_to(address=0x00477042, limit=50)
+
+Data read:
+- From 0x004018b9 in FUN_0040185f [DATA]
+- From 0x004018c3 in FUN_0040185f [PARAM]
+
+Interpretation and why:
+- FUN_0040185f is the function printing usage/help and likely handling CLI args.
+- Decompiling this function should identify the password-check callee.
+
+Supporting exploration:
+- user-ghidra-search_functions_by_name(query="main", limit=20) -> no direct "main" symbol.
+- user-ghidra-list_methods(limit=300) -> saw FUN_0040185f and many unnamed FUN_... symbols.
+
+Interpretation:
+- Stripped/unnamed binary is normal; function discovery must proceed by xrefs and logic.
+
+============================================================
+3) Decompile the Argument Handler
+============================================================
+Action:
+- Decompile FUN_0040185f.
+
+Tool used:
+- user-ghidra-decompile_function_by_address(address=0x0040185f)
+
+Data read (exact decompilation):
+
+int FUN_0040185f(int param_1,undefined8 *param_2)
+{
+  int local_c;
+  
+  if (param_1 == 2) {
+    local_c = FUN_0040176f(param_2[1]);
+    if (local_c == 1) {
+      FUN_0040a290("You achieved Level 3!");
+    }
+    else {
+      FUN_0040a290("Sorry, not quite there yet.");
+    }
+  }
+  else {
+    FUN_00404920("Usage: %s <password>\n",*param_2);
+  }
+  return local_c;
+}
+
+Interpretation and why:
+- `param_1 == 2` means program expects exactly one CLI argument (the password candidate).
+- `FUN_0040176f(param_2[1])` is the validator.
+- Success/failure branching confirms `FUN_0040176f` returns pass/fail.
+- Next step: decompile `FUN_0040176f`.
+
+============================================================
+4) Decompile the Password Validator
+============================================================
+Action:
+- Decompile FUN_0040176f.
+
+Tool used:
+- user-ghidra-decompile_function_by_address(address=0x0040176f)
+
+Data read (key points from decompilation):
+- Function initializes a stack-local byte array with hardcoded bytes:
+  0x85, 0x8f, 0x82, 0x84, 0xbc, ... , 0x9e, 0xe3, 0x00
+- Calls:
+  FUN_00401725(&local_38, 0x2b, 0xffffffe3)
+- Then compares:
+  iVar1 = thunk_FUN_00416db0(param_1, &local_38);
+  return iVar1 == 0;
+
+Interpretation and why:
+- `0x2b` = 43 bytes transformed in-place.
+- Third arg `0xffffffe3` cast to byte is `0xE3`.
+- `thunk_FUN_00416db0` behavior fits `strcmp`-like compare (returns 0 on match).
+- Therefore: expected password is transformed version of those 43 bytes using routine in `FUN_00401725`.
+
+Next step:
+- Decompile/disassemble `FUN_00401725` to determine exact transform.
+
+============================================================
+5) Reverse the Transform Routine
+============================================================
+Actions:
+- Decompile `FUN_00401725`.
+- Disassemble `FUN_00401725` to confirm decompiler interpretation.
+
+Tools used:
+- user-ghidra-decompile_function_by_address(address=0x00401725)
+- user-ghidra-disassemble_function(address=0x00401725)
+
+Data read (decompilation):
+
+void FUN_00401725(long param_1,int param_2,byte param_3)
+{
+  undefined4 local_c;
+  
+  for (local_c = 0; local_c < param_2; local_c = local_c + 1) {
+    *(byte *)(param_1 + local_c) = *(byte *)(param_1 + local_c) ^ param_3;
+  }
+  return;
+}
+
+Data read (assembly confirmation):
+- Core instruction: `XOR AL, byte ptr [RBP + -0x20]`
+- Loop over bytes until index < length.
+
+Interpretation and why:
+- Routine is a simple byte-wise XOR decrypt/encrypt.
+- Key = `0xE3`.
+- So plaintext password is: each stored byte XOR `0xE3`.
+
+============================================================
+6) Decode Bytes to Recover Plaintext Password
+============================================================
+Action:
+- Decode the byte list by XOR with 0xE3 using Python.
+
+Command run:
+python3 - <<'PY'
+arr=[0x85,0x8f,0x82,0x84,0xbc,0x98,0xaf,0x8a,0x8d,0xd0,0xbc,0xbb,0xac,0xb1,0xbc,0xd0,0x8d,0xa0,0x91,0x9a,0x93,0xc8,0xd2,0xd3,0x8d,0xbc,0x8a,0xc7,0xbc,0xad,0x8c,0xbc,0x93,0x91,0xac,0x81,0xaf,0xd0,0x8e,0xc2,0x9e,0xe3]
+print(bytes([b^0xE3 for b in arr]))
+print(''.join(chr(b^0xE3) for b in arr))
+PY
+
+Data read (exact output):
+- b'flag_{Lin3_XOR_3nCryp+10n_i$_No_prObL3m!}\x00'
+- flag_{Lin3_XOR_3nCryp+10n_i$_No_prObL3m!} followed by NUL terminator
+
+Interpretation and why:
+- Final `\x00` is string terminator, not part of typed password.
+- Recovered password string is:
+  flag_{Lin3_XOR_3nCryp+10n_i$_No_prObL3m!}
+
+============================================================
+7) Final Conclusion
+============================================================
+Discovered password:
+- flag_{Lin3_XOR_3nCryp+10n_i$_No_prObL3m!}
+
+Validation logic summary:
+- Program expects one CLI argument.
+- It builds an obfuscated byte array in local memory.
+- It XOR-decrypts 43 bytes with key 0xE3.
+- It compares decrypted string against user input.
+- Match returns success path ("You achieved Level 3!").
+
+============================================================
+8) Complete Tool/Command Inventory Used
+============================================================
+Ghidra MCP:
+1. user-ghidra-list_strings(limit=2000)
+2. user-ghidra-list_imports(limit=300)
+3. user-ghidra-list_exports(limit=200)
+4. user-ghidra-get_xrefs_to(address=0x00477042, limit=50)
+5. user-ghidra-search_functions_by_name(query="main", limit=20)
+6. user-ghidra-list_methods(limit=300)
+7. user-ghidra-decompile_function_by_address(address=0x0040185f)
+8. user-ghidra-decompile_function_by_address(address=0x0040176f)
+9. user-ghidra-decompile_function_by_address(address=0x00401725)
+10. user-ghidra-disassemble_function(address=0x00401725)
+
+Shell:
+1. ls -la "/home/kali/Documents/MCPTesting/Test_Logs" (directory check)
+2. python3 XOR decode script (recover plaintext from obfuscated bytes)
+
+============================================================
+9) Why This Method Was Chosen
+============================================================
+- Fastest high-confidence route in stripped binaries is:
+  strings -> xrefs -> decompile validator -> reverse transform.
+- This avoids guessing and provides a reproducible proof chain from code to final password.
+
+End of log.

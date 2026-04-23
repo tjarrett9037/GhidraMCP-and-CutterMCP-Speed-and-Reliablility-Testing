@@ -1,0 +1,183 @@
+Level 4 Password Recovery Log
+Date: 2026-03-31
+Analyst: GPT coding agent via MCP + Ghidra tools
+Objective: Identify the embedded password used by the malware sample for its "success" path.
+
+================================================================
+1) Initial hypothesis and triage strategy
+================================================================
+Reasoning:
+- User stated there may be a shutdown password in a ransomware sample.
+- Fastest static approach: search strings and obvious auth-related function names.
+- If found, decompile check routine and reverse transformations.
+
+Actions executed:
+- list_strings(limit=2000)
+- search_functions_by_name(query="pass")
+- search_functions_by_name(query="crypt")
+- search_functions_by_name(query="kill")
+- search_functions_by_name(query="stop")
+
+Raw data read:
+- list_strings returned (notable values):
+  - "/lib64/ld-linux-x86-64.so.2"
+  - "puts"
+  - "__libc_start_main"
+  - "__cxa_finalize"
+  - "memcmp"
+  - "printf"
+  - "memcpy"
+  - "libc.so.6"
+  - "GLIBC_2.14"
+  - "GLIBC_2.2.5"
+  - "GLIBC_2.34"
+  - "_ITM_deregisterTMCloneTable"
+  - "__gmon_start__"
+  - "_ITM_registerTMCloneTable"
+  - "You achieved Level 4!"
+  - "Sorry, not quite there yet."
+  - "Usage: %s <password>\n"
+  - "zR"
+  - "zR"
+  - plus ELF section names and GCC build string
+- function-name searches:
+  - "pass": No functions matching
+  - "crypt": No functions matching
+  - "kill": No functions matching
+  - "stop": No functions matching
+
+Interpretation and why:
+- The string "Usage: %s <password>\n" indicates command-line password verification logic exists.
+- Success/failure strings strongly imply a binary challenge-check function.
+- "memcmp" + "memcpy" imports suggest byte-buffer compare against transformed data.
+- No semantic function names means likely stripped/obfuscated symbols, so address-based decompilation is needed.
+
+================================================================
+2) Function map and entrypoint discovery
+================================================================
+Actions executed:
+- list_functions()
+- list_exports(limit=200)
+- get_current_function()
+
+Raw data read:
+- list_functions notable:
+  - entry at 00101080
+  - FUN_00101169
+  - FUN_0010144d
+  - FUN_0010157f
+  - imported stubs for puts/printf/memcmp/memcpy
+- list_exports notable:
+  - entry -> 00101080
+- get_current_function:
+  - Function: entry at 00101080
+  - Signature: undefined processEntry entry(void)
+
+Interpretation and why:
+- Candidate "main-like" logic likely in one of FUN_... internal functions.
+- Since strings included usage/success/failure text, I targeted functions near apparent high-level control flow and compare logic.
+
+================================================================
+3) Decompilation of candidate functions
+================================================================
+Actions executed:
+- decompile_function_by_address(address="0x0010157f")
+- decompile_function_by_address(address="0x00101169")
+- decompile_function_by_address(address="0x0010144d")
+
+----------------------------------------------------------------
+3.1) FUN_0010157f (high-level controller)
+----------------------------------------------------------------
+Raw decompiled behavior:
+- If argc == 2:
+  - local_c = FUN_0010144d(argv[1]);
+  - if local_c == 1: puts("You achieved Level 4!");
+  - else: puts("Sorry, not quite there yet.");
+- else:
+  - printf("Usage: %s <password>\n", argv[0]);
+
+Interpretation and why:
+- Confirms password is one argument, checked by FUN_0010144d.
+- "You achieved Level 4!" is success path, so solving FUN_0010144d reveals expected input.
+
+----------------------------------------------------------------
+3.2) FUN_0010144d (password verification core)
+----------------------------------------------------------------
+Raw decompiled behavior:
+- Initializes a 49-byte static byte sequence in local variables:
+  bf 2b 00 b8 51 2d 62 39 37 65 78 41 b4 7c 65 8c
+  ed 26 42 07 05 7b 55 f3 99 d6 2f 56 7b 80 46 40
+  e6 6f 97 17 38 ca 00 28 6c 95 7a a7 37 eb e6 9d
+  71 16
+- memcpy(local_88, &local_48, 0x31)  // copy 49 bytes
+- FUN_00101169(local_88, 0x31, 0x1d6796e070c749b7)
+- iVar1 = memcmp(local_88, param_1, 0x31)
+- return (iVar1 == 0)
+
+Interpretation and why:
+- It transforms the embedded 49-byte blob via FUN_00101169 with 8-byte key constant.
+- Then compares transformed bytes against user input.
+- Therefore the transformed plaintext buffer is the correct password.
+
+----------------------------------------------------------------
+3.3) FUN_00101169 (transform routine)
+----------------------------------------------------------------
+Raw decompiled behavior (key points):
+- Initializes S-box array abStack_178[256] = 0..255.
+- Performs KSA-like permutation loop using key bytes from param_3:
+  local_10 = (S[i] + local_10 + S[(i % 8) + -8]) % 256
+  (Decompiler artifact; effective source is bytes of passed 64-bit key)
+- Performs PRGA-like keystream generation for param_2 bytes.
+- XORs generated stream with buffer at param_1.
+
+Interpretation and why:
+- This matches RC4 structure (KSA + PRGA + XOR).
+- Because RC4 encryption/decryption are symmetric, running this on ciphertext yields plaintext password.
+
+================================================================
+4) Reconstructing the password outside Ghidra
+================================================================
+Goal:
+- Reproduce FUN_00101169 algorithm to decrypt the 49-byte blob.
+
+Attempt A:
+- Ran python script importing Crypto.Cipher.ARC4
+- Result:
+  - ModuleNotFoundError: No module named 'Crypto'
+
+Interpretation:
+- PyCryptodome unavailable in environment. Not a blocker.
+
+Attempt B (successful):
+- Implemented RC4 manually in Python:
+  - key = (0x1d6796e070c749b7).to_bytes(8, 'little')
+  - ct = 49-byte array from FUN_0010144d
+  - RC4 KSA + PRGA + XOR
+
+Raw output:
+- key bytes: b749c770e096671d
+- plaintext bytes:
+  b'flag_{Lin4_D3bugg1ng_iS_MucH_f@5t3r_For_th1$_On3!}'
+- decoded string:
+  flag_{Lin4_D3bugg1ng_iS_MucH_f@5t3r_For_th1$_On3!}
+- hex:
+  666c61675f7b4c696e345f443362756767316e675f69535f4d7563485f6640357433725f466f725f746831245f4f6e33217d
+
+Interpretation and why:
+- This output is exactly 49 bytes, matching memcmp length 0x31.
+- It is printable ASCII and formatted as intentional challenge text.
+- Therefore this is the exact expected argument for success.
+
+================================================================
+5) Final conclusion
+================================================================
+Recovered password:
+flag_{Lin4_D3bugg1ng_iS_MucH_f@5t3r_For_th1$_On3!}
+
+Confidence:
+High (directly derived from verification routine and length-accurate memcmp target).
+
+Validation logic:
+- Binary checks memcmp(transformed_embedded_blob, argv[1], 49) == 0.
+- Reversing transform yields the required argv[1] string above.
+

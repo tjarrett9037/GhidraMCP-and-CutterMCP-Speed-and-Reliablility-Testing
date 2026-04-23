@@ -1,0 +1,207 @@
+Ransomware Password Recovery Log
+Date: 2026-03-31
+Environment: Ghidra MCP tools + local Python verification
+Objective: Identify the shutdown password (or equivalent passphrase) accepted by the sample.
+
+================================================================
+1) Initial triage: search all strings for likely password/kill-switch hints
+================================================================
+
+Action:
+- Queried Ghidra strings using filters:
+  - "pass"
+  - "shut"
+  - "kill"
+  - "decrypt"
+  - "stop"
+
+Raw data read:
+- Filter "pass":
+  - 00478058: "Usage: %s <password>\n"
+- Filter "shut":
+  - 0047b598: "tcache_thread_shutdown(): unaligned tcache chunk detected"
+  - 0047c4f8: "Cannot send after transport endpoint shutdown"
+  - 0047f265: "ESHUTDOWN"
+- Filter "kill":
+  - 0047c550: "Operation not possible due to RF-kill"
+- Filters "decrypt" and "stop":
+  - no relevant strings returned
+
+Interpretation and why:
+- "Usage: %s <password>\n" is highly relevant because it indicates a direct CLI password check path.
+- The shutdown/kill hits looked like libc/system strings (generic runtime/system messages), not custom malware logic.
+- Therefore I pivoted directly from the usage string to its cross references.
+
+================================================================
+2) Trace cross-references to the password usage string
+================================================================
+
+Action:
+- Queried xrefs-to address 0x00478058.
+
+Raw data read:
+- From 0040262b in FUN_004025d1 [DATA]
+- From 00402635 in FUN_004025d1 [PARAM]
+
+Interpretation and why:
+- Both references point to function FUN_004025d1, likely the main argument parser or entry check.
+- Next step: decompile FUN_004025d1 to identify control flow and called validator function.
+
+================================================================
+3) Decompile argument parser/check function
+================================================================
+
+Action:
+- Decompiled function at 0x004025d1.
+
+Raw decompiled logic (key points):
+- If argc == 2:
+  - local_c = FUN_004023a8(argv[1]);
+  - if local_c == 1 -> print "You achieved Level 9!"
+  - else -> print "Sorry, not quite there yet."
+- Else:
+  - print "Usage: %s <password>\n"
+
+Interpretation and why:
+- This clearly identifies FUN_004023a8 as the password-validation function.
+- Success condition is explicit return value == 1.
+- I then moved to reverse FUN_004023a8.
+
+================================================================
+4) Decompile the validator function
+================================================================
+
+Action:
+- Decompiled function at 0x004023a8.
+
+Raw data read (important parts):
+- It initializes a 0x34-byte local array (local_78) with fixed bytes:
+  41 9c 6d b9 8d c2 6f af a2 93 48 01 6d 68 9c 11
+  08 4c cc e4 ad 23 30 02 9f e6 92 dc af 83 fd bb
+  8b 7c 40 6a 08 be 04 14 ff cd 62 12 51 5b 58 8c
+  5b c2 bc e3
+- It copies 0x34 bytes from user input into local_b8.
+- It runs:
+  FUN_00401974(local_b8, 0x34, 0x123456789abcdef);
+- Then compares every byte local_b8[i] to local_78[i].
+- Returns 1 only if all 52 bytes match.
+- Additional anti-analysis/timing checks:
+  - calls FUN_00402354 and FUN_00401b1e (must both return 0)
+  - computes elapsed time; fails if > 500 ms
+
+Interpretation and why:
+- The password is 52 bytes long (0x34).
+- local_78 is a transformed target array.
+- User input is transformed in-place by FUN_00401974 and compared to target.
+- So recovering password means inverting (or reproducing and XORing back) FUN_00401974.
+
+================================================================
+5) Analyze the transform routine and helper crypto/math routines
+================================================================
+
+Action:
+- Decompiled:
+  - FUN_00401974 (transform stream/XOR routine)
+  - FUN_004017fa (8-round word permutation/mixing routine)
+  - FUN_00401799 (16-bit multiply/combine primitive)
+
+Raw data read (key observations):
+- FUN_00401974:
+  - Splits 64-bit key param into 8 key bytes, then 4x16-bit words.
+  - Uses a 64-bit counter local_18 starting at 0.
+  - For each 8-byte block, builds 4 words from counter:
+    [ctr>>48, ctr>>32, ctr>>16, ctr]
+  - Calls FUN_004017fa(key_words, counter_words)
+  - XORs transformed counter_words bytes into data (stream-cipher-like keystream).
+- FUN_00401799:
+  - Uses 16-bit operands, multiplies to 32-bit, then computes:
+    (low16(product) - high16(product)) and subtracts 1 if product > 0xffff.
+- FUN_004017fa:
+  - 8 rounds of mixed add/xor/mul operations over 16-bit words.
+  - Final output word order differs from internal temporaries.
+
+Interpretation and why:
+- Since transform is XOR with deterministic keystream, original password can be recovered by:
+  plaintext = target_bytes XOR keystream
+- Exact operation ordering and final word arrangement mattered; I needed assembly verification to avoid decompiler variable confusion.
+
+================================================================
+6) Assembly verification to resolve decompiler ambiguities
+================================================================
+
+Action:
+- Disassembled:
+  - FUN_00401799 @ 0x00401799
+  - FUN_00401974 @ 0x00401974
+  - FUN_004017fa @ 0x004017fa
+
+Raw data read and interpretation:
+- FUN_00401799 disassembly confirmed:
+  - plain unsigned 16x16 multiplication in EAX
+  - combine formula exactly as modeled above
+  - no special "0 means 65536" behavior (important correction)
+- FUN_00401974 disassembly confirmed:
+  - keystream byte extraction from 16-bit words is:
+    even index -> high byte, odd index -> low byte
+  - block/counter progression is exactly 8-byte stride, ctr++
+- FUN_004017fa disassembly confirmed:
+  - the sequence corresponds to an IDEA-like round structure.
+  - final store order is [local_-2, local_-6, local_-4, local_-8]
+    (this was the crucial ordering detail for correct decryption).
+
+Why this mattered:
+- My first two Python reproductions produced non-printable output because the round mapping/order was slightly wrong.
+- Assembly-level confirmation fixed the model.
+
+================================================================
+7) Iterative local verification with Python
+================================================================
+
+Action:
+- Ran local Python scripts to emulate transform and derive plaintext.
+
+Observed outputs:
+1) First attempt:
+   - Non-UTF8/non-printable bytes
+2) Second attempt:
+   - Still mostly non-printable output
+3) After correcting round mapping/order to match disassembly:
+   - Output became:
+     b'flag_{Lin9_Inl1n!ng_FuNc+10n5_i$_Ug1y_bUt_$0Lv4bL3.}'
+   - ASCII view:
+     flag_{Lin9_Inl1n!ng_FuNc+10n5_i$_Ug1y_bUt_$0Lv4bL3.}
+
+Interpretation and why:
+- Third output is clearly intentional CTF-style plaintext and exactly 0x34 bytes, matching required compare length.
+- This is the valid password string expected by FUN_004023a8.
+
+================================================================
+8) Final recovered password
+================================================================
+
+Recovered password:
+flag_{Lin9_Inl1n!ng_FuNc+10n5_i$_Ug1y_bUt_$0Lv4bL3.}
+
+Confidence:
+- High. It is mathematically derived from the binary's own validation pipeline and fits all constraints:
+  - exact required length (52 bytes)
+  - exact post-transform byte-for-byte target match by construction
+  - coherent human-readable token consistent with challenge formatting
+
+================================================================
+9) Concise timeline of tool calls
+================================================================
+
+1. list_strings("pass","shut","kill","decrypt","stop")
+2. get_xrefs_to(0x00478058)
+3. decompile(0x004025d1)
+4. decompile(0x004023a8)
+5. decompile(0x00401974)
+6. decompile(0x004017fa)
+7. decompile(0x00401799)
+8. disassemble(0x00401799)
+9. disassemble(0x00401974)
+10. disassemble(0x004017fa)
+11. local python emulation (3 iterations) until exact decode
+
+End of report.

@@ -1,0 +1,140 @@
+Ransomware Password Recovery Log (Ghidra + Cutter)
+Date: 2026-04-08
+Analyst: Cursor agent session log
+
+Objective
+- Find the password/kill input required to trigger the positive branch (shutdown/success path) in the loaded sample.
+- Use both Ghidra and Cutter outputs for cross-verification.
+
+Step 1 - Initial triage using parallel metadata extraction
+Why:
+- Fastest way to locate likely password checks is to inspect strings, imports, and function names first.
+- If `strcmp` exists and there is a function name like `check_password`, that usually indicates direct credential comparison logic.
+
+Tool calls and data read:
+1) Ghidra: list_strings(limit=2000)
+   Key strings returned:
+   - "You achieved Level 2!"
+   - "Sorry, not quite there yet."
+   - "Usage: %s <password>\n"
+   - "zR"
+   - Symbol names included "check_password", "main" in string table.
+
+Interpretation:
+- The sample appears to be challenge-like and takes a password argument.
+- Presence of success/fail messages indicates a conditional branch controlled by a compare routine.
+
+2) Cutter: list_imports(limit=200)
+   Imports included:
+   - __libc_start_main
+   - puts
+   - printf
+   - strcmp
+   - __cxa_finalize
+
+Interpretation:
+- `strcmp` import strongly suggests plain-text or reconstructed string equality checking.
+- `printf` + usage string suggests CLI argument checking and direct user input path.
+
+3) Cutter: list_functions(limit=300)
+   Functions included:
+   - sym.check_password at 0x00001159
+   - main at 0x0000123e
+
+Interpretation:
+- `sym.check_password` is the primary target for password extraction.
+- `main` should show how this function is invoked and whether argv is used directly.
+
+Step 2 - Directly decompile password checker in both tools
+Why:
+- The most accurate route is to inspect the exact comparison logic where authentication decision is made.
+- Cross-tool confirmation reduces decompiler artifact risk.
+
+Tool calls and data read:
+1) Ghidra: decompile_function(name="check_password")
+   Decompiled logic:
+   - Creates local buffer.
+   - Copies literal string:
+     "flag_{Lin2_WhY_1S_th!$_sTr1n9_h@rD3r_T0_fiNd?}"
+   - Runs strcmp(param_1, local_38)
+   - Returns true if strcmp == 0
+
+Interpretation:
+- Candidate password appears directly as a literal in decompiled C output.
+- Since return value is boolean on `strcmp == 0`, exact character match is required.
+
+2) Cutter: decompile_function_by_address(address="0x00001159")
+   Decompiled logic:
+   - Populates stack bytes one-by-one (0x66 'f', 0x6c 'l', etc.) ending with 0x00 null byte.
+   - Final compare: strcmp(arg1, &s2)
+
+Interpretation:
+- Cutter represents the same target string as incremental byte stores instead of one literal.
+- This confirms the password is intentionally reconstructed in memory but still plain and deterministic.
+
+3) Cutter: disassemble_function(address="0x00001159")
+   Assembly shows:
+   - Consecutive `mov byte [stack+offset], imm8` instructions building:
+     flag_{Lin2_WhY_1S_th!$_sTr1n9_h@rD3r_T0_fiNd?}
+   - `call strcmp`
+   - `test eax, eax` + `sete al`
+
+Interpretation:
+- Instruction-level evidence confirms exact byte sequence and null-terminated string.
+- `sete` after `test eax,eax` means only zero result from strcmp (exact match) passes.
+
+Step 3 - Validate call path in program entry logic
+Why:
+- Needed to ensure extracted value is truly the runtime password gate and not dead code.
+
+Tool calls and data read:
+1) Ghidra: list_methods(limit=200)
+   Included:
+   - check_password
+   - main
+
+2) Ghidra: get_function_xrefs(name="check_password", limit=50)
+   Returned reference:
+   - From 0x00101261 in main [UNCONDITIONAL_CALL]
+
+Interpretation:
+- `main` definitely calls `check_password`, confirming live path.
+
+3) Ghidra: decompile_function(name="main")
+   Logic:
+   - If argc == 2:
+       iVar1 = check_password(argv[1])
+       if false -> puts("Sorry, not quite there yet.")
+       else     -> puts("You achieved Level 2!")
+   - Else: printf("Usage: %s <password>\n", argv[0])
+
+4) Cutter: decompile_function_by_address(address="0x0000123e")
+   Equivalent logic:
+   - argc must be 2
+   - check_password(argv[1]) determines success/fail message
+
+Interpretation:
+- Password input source is unequivocally `argv[1]`.
+- Success output is directly tied to check_password returning true.
+
+Final extracted password
+- flag_{Lin2_WhY_1S_th!$_sTr1n9_h@rD3r_T0_fiNd?}
+
+Confidence assessment
+- High confidence (multi-source concordance):
+  1) Ghidra high-level decompilation exposes exact literal.
+  2) Cutter decompilation reconstructs identical byte sequence.
+  3) Cutter assembly confirms byte-level correctness and compare semantics.
+  4) main() in both tools confirms active call path from argv to success/failure branch.
+
+Notes on unusual outputs
+- Cutter emitted variable-overlap warnings in decompile view.
+- These warnings are expected artifacts around stack byte overlays and do not affect the reconstructed string validity because:
+  - Disassembly independently confirms each byte write.
+  - Final comparison call and branching are straightforward and unambiguous.
+
+Operational reproduction (for verification in isolated lab only)
+- Program invocation pattern: <binary> <password>
+- Correct input should print: "You achieved Level 2!"
+
+End of log.

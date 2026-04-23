@@ -1,0 +1,364 @@
+Ransomware Password Recovery Log
+Date: 2026-04-08
+Analyst: Cursor coding agent (with Ghidra + Cutter MCP tools)
+
+Objective
+- Find a password in the loaded ransomware sample that appears to shut down / satisfy the malware's password gate.
+- Use both Ghidra and Cutter to increase speed while cross-validating accuracy.
+
+Method Summary
+- I treated this as a static reversing workflow:
+  1) find candidate strings and imports,
+  2) locate xrefs into likely argument-check logic,
+  3) decompile the validator,
+  4) reverse the transformation routine,
+  5) recover and validate plaintext password length and exact compared bytes.
+
+Detailed Step-by-Step Execution, Data Read, Interpretation, and Why
+
+Step 1: Initial string triage in Ghidra + imports in both tools
+Commands/queries run:
+- Ghidra list_strings(filter="pass")
+- Ghidra list_strings(filter="shut")
+- Ghidra list_strings(filter="kill")
+- Ghidra list_strings(filter="stop")
+- Cutter list_imports
+- Ghidra list_imports
+
+Raw data returned:
+- Ghidra string hit (filter="pass"):
+  0x00477042: "Usage: %s <password>\n"
+- Ghidra string hits (other filters):
+  0x0047a578: "tcache_thread_shutdown(): unaligned tcache chunk detected"
+  0x0047b4d8: "Cannot send after transport endpoint shutdown"
+  0x0047e245: "ESHUTDOWN"
+  0x0047b530: "Operation not possible due to RF-kill"
+- Cutter imports: no useful output in this binary context (empty listing in tool response).
+- Ghidra imports: no useful output in this binary context (empty listing in tool response).
+
+Interpretation:
+- "Usage: %s <password>\n" was a high-confidence anchor indicating command-line password checking.
+- The shutdown/kill strings appeared to be generic runtime/libc/network strings, not bespoke malware control strings.
+- Imports did not provide immediate clarity, so string xrefs became the fastest pivot.
+
+Why this step:
+- Fastest way to locate authentication gates is searching for password-like UI strings and usage messages.
+
+Step 2: Cross-reference the usage/password string
+Commands/queries run:
+- Ghidra get_xrefs_to(address=0x00477042)
+- Cutter xrefs_to(address=0x00477042)
+- Ghidra search_functions_by_name("main")
+- Cutter search_functions_by_name("main")
+
+Raw data returned:
+- Ghidra xrefs to 0x00477042:
+  From 0x00401b95 in FUN_00401b3b [DATA]
+  From 0x00401b9f in FUN_00401b3b [PARAM]
+- Cutter xref:
+  (nofunc) 0x401b95 [DATA] lea rdx, str.Usage:__s__password
+- search for "main": no direct main symbol discovered.
+
+Interpretation:
+- Function at 0x00401b3b likely behaves as entry/dispatcher for CLI args.
+- Lack of main symbol is common in stripped binaries; address-based analysis is appropriate.
+
+Why this step:
+- Xrefs convert string clues into executable control-flow and pinpoint where the password path branches.
+
+Step 3: Decompile and disassemble 0x00401b3b to identify validator call
+Commands/queries run:
+- Ghidra decompile_function_by_address(0x00401b3b)
+- Cutter decompile_function_by_address(0x00401b3b)
+- Ghidra disassemble_function(0x00401b3b)
+
+Raw data read (key points):
+- Decompiled logic from Ghidra:
+  if argc == 2:
+    local_c = FUN_00401a09(argv[1]);
+    if local_c == 1 -> print "You achieved Level 4!"
+    else -> print "Sorry, not quite there yet."
+  else:
+    printf("Usage: %s <password>\n", argv[0]);
+- Disassembly confirms:
+  - argc compared to 2
+  - argv[1] passed into call at 0x00401a09
+  - success/failure strings selected based on return value
+
+Interpretation:
+- 0x00401a09 is the password validator.
+- Return value semantics: validator returns true/equal for success branch.
+
+Why this step:
+- Needed to isolate the one function that directly compares user input.
+
+Step 4: Decompile/disassemble validator function 0x00401a09 in both tools
+Commands/queries run:
+- Ghidra decompile_function_by_address(0x00401a09)
+- Ghidra disassemble_function(0x00401a09)
+- Cutter decompile_function_by_address(0x00401a09)
+- Cutter disassemble_function(0x00401a09)
+
+Raw data read (core logic):
+- Function initializes 49 bytes of embedded data (stack bytes from 0xBF, 0x2B, ..., 0x16).
+- Calls:
+  1) copy/memmove-like thunk at 0x00401030 with length 0x31
+  2) transformation function FUN_00401725(buffer, 0x31, 0x1d6796e070c749b7)
+  3) compare thunk at 0x00401070(buffer, user_input, 0x31)
+- Returns comparison == 0.
+
+Interpretation:
+- Validator stores encrypted/obfuscated expected bytes in-function.
+- Applies deterministic stream transform using 8-byte key constant.
+- Compares transformed bytes with user input over exactly 0x31 (49) bytes.
+
+Why this step:
+- To recover plaintext password, transformation routine needed full reverse understanding.
+
+Step 5: Reverse transformation routine at 0x00401725
+Commands/queries run:
+- Ghidra decompile_function_by_address(0x00401725)
+- Cutter decompile_function_by_address(0x00401725)
+- Also decompiled 0x00401030 and 0x00401070 (thunks/ifunc wrappers).
+
+Raw data read (algorithm characteristics):
+- Initializes S-box array 0..255
+- KSA-like loop using 8-byte key material (mod 8 indexing)
+- PRGA-like loop generating keystream for length N (N = 0x31)
+- XORs keystream with buffer bytes in place
+- This is RC4-like stream cipher behavior.
+
+Interpretation:
+- Since operation is XOR with generated keystream, encryption and decryption are symmetric.
+- Therefore, applying same RC4-like transform with same key to embedded ciphertext yields plaintext expected input.
+
+Why this step:
+- This is the mathematical path to derive the exact password bytes.
+
+Step 6: Reconstruct and execute decoder script in Python
+Command run:
+- Python script reproducing RC4-like KSA+PRGA exactly as decompiled, with:
+  - encrypted byte array of 50 listed bytes from function initialization
+  - key = 0x1d6796e070c749b7, interpreted little-endian to match memory layout
+
+Raw output:
+- bytes(out) -> b'flag_{Lin4_D3bugg1ng_iS_MucH_f@5t3r_For_th1$_On3!}'
+- utf-8 decode -> flag_{Lin4_D3bugg1ng_iS_MucH_f@5t3r_For_th1$_On3!}
+
+Interpretation:
+- This yields a brace-closed string with total length 50.
+- However, validator compare length is 49 bytes, so only first 49 bytes are semantically checked.
+
+Why this step:
+- Converted static reverse insight into concrete recovered credential candidate.
+
+Step 7: Validate compared length and exact accepted prefix
+Commands run:
+- Python len(full_string)
+- Python print(full_string[:49]) and len(full_string[:49])
+
+Raw output:
+- Full decoded string length: 50
+- First 49 bytes:
+  flag_{Lin4_D3bugg1ng_iS_MucH_f@5t3r_For_th1$_On3!
+- Prefix length: 49
+
+Interpretation:
+- Strictly validated bytes are 49-long prefix.
+- The final "}" exists in decoded material but is not part of the memcmp length in validator path.
+
+Why this step:
+- Prevents off-by-one mistakes and clarifies exact acceptance behavior.
+
+Final Findings
+- Recovered candidate (decoded full text):
+  flag_{Lin4_D3bugg1ng_iS_MucH_f@5t3r_For_th1$_On3!}
+- Exact compared 49-byte password region in validator:
+  flag_{Lin4_D3bugg1ng_iS_MucH_f@5t3r_For_th1$_On3!
+
+Cross-Tool Confidence Notes
+- Ghidra and Cutter independently corroborated:
+  - function addresses,
+  - argument flow into validator,
+  - RC4-like transform structure,
+  - fixed compare length (0x31).
+- Cutter decompiler had overlap warnings, but assembly-level behavior matched Ghidra's interpretation.
+
+Assumptions and Limits
+- Analysis was static and did not execute malware payload.
+- Result is based on reverse-engineered validation path observed in loaded sample.
+- If alternate code paths exist (e.g., network C2 override or anti-analysis branch), they were not needed for this specific password gate recovery.
+Ransomware Password Recovery Investigation Log
+Date: 2026-04-08
+Analyst: Cursor AI Agent
+Host: /home/kali
+Objective: Identify possible shutdown/kill-switch password embedded in analyzed sample loaded in Ghidra and Cutter.
+
+====================================================================
+1) METHOD OVERVIEW
+====================================================================
+I used a two-stage workflow:
+1. Fast triage for likely password strings and compare logic.
+2. Cross-tool validation in both Ghidra and Cutter to confirm the same behavior in control flow.
+
+Why this approach:
+- Hardcoded passwords often appear in .rodata and are then consumed by strcmp/memcmp-style logic.
+- String-first triage is faster, then control-flow verification reduces false positives.
+
+====================================================================
+2) CHRONOLOGICAL STEPS, DATA READ, INTERPRETATION, AND RATIONALE
+====================================================================
+
+Step 1 - Bulk reconnaissance via parallel queries
+Tools used:
+- Ghidra: list_strings(limit=2000)
+- Cutter: list_imports(limit=200)
+- Cutter: list_functions(limit=200)
+- Ghidra: list_imports(limit=200)
+
+Raw data read (key excerpts):
+
+[Ghidra list_strings] notable entries:
+- 0047700e: "@@flag_{Lin1_Th4tS_wHy_y0u_@Lw4y5_$t4rT_w1tH_stR!n6$!}"
+- 00477045: "You achieved Level 1!"
+- 0047705b: "Sorry, not quite there yet."
+- 00477077: "Usage: %s <password>\n"
+
+The same response also contained a very large number of glibc/runtime strings.
+
+[Cutter list_imports]
+- Output effectively empty (header only): no high-value custom import clues from this call.
+
+[Cutter list_functions] notable entries:
+- 0x00401725 main
+- 0x00401098 fcn.00401098 (called from main)
+- Many libc/runtime symbols and helper functions.
+
+[Ghidra list_imports]
+- No useful output returned in this call.
+
+Interpretation:
+- The string "flag_{...}" was an immediate high-confidence candidate for a password-like token.
+- The presence of explicit UX strings ("Usage: %s <password>", success/failure messages) strongly implied direct user input validation against a static string.
+- main at 0x00401725 became the primary function for validation.
+
+Why I moved to next step:
+- Candidate identified, but needed proof this exact string controls success behavior and is not dead data/decoy.
+
+--------------------------------------------------------------------
+
+Step 2 - Decompile main in both tools and cross-check semantics
+Tools used:
+- Ghidra: decompile_function(name="main")
+- Cutter: decompile_function_by_address(address="0x00401725")
+- Ghidra: get_function_xrefs(name="puts", limit=200)
+
+Raw data read (verbatim critical fragments):
+
+[Ghidra decompile main]
+int main(int param_1,undefined8 *param_2)
+{
+  int local_c;
+  if (param_1 == 2) {
+    local_c = strcmp((char *)param_2[1],"flag_{Lin1_Th4tS_wHy_y0u_@Lw4y5_$t4rT_w1tH_stR!n6$!}");
+    if (local_c == 0) {
+      puts("You achieved Level 1!");
+    } else {
+      puts("Sorry, not quite there yet.");
+    }
+  } else {
+    printf("Usage: %s <password>\n",*param_2);
+  }
+  return local_c;
+}
+
+[Cutter decompile main @ 0x00401725] relevant fragment:
+- if (argc == 2) {
+-   var_ch._0_4_ = fcn.00401098(argv[1], data.00477010);
+-   if ((int32_t)var_ch == 0) puts("You achieved Level 1!");
+-   else puts("Sorry, not quite there yet.");
+- } else {
+-   __printf(..., 0x477077, (int64_t)*argv, ...);
+- }
+
+[Ghidra get_function_xrefs("puts")]
+- References included calls from main:
+  - From 0040176a in main [UNCONDITIONAL_CALL]
+  - From 0040177b in main [UNCONDITIONAL_CALL]
+
+Interpretation:
+- Ghidra explicitly resolves the comparison as strcmp(user_input, hardcoded_string).
+- Cutter shows equivalent behavior but with unresolved symbol name fcn.00401098 and static data pointer data.00477010.
+- xrefs confirmed that the success/failure puts calls in main correspond to that decision branch.
+
+Why I moved to next step:
+- Needed one more low-level confirmation that pointer/address wiring truly maps argv[1] to data.00477010 and then to branch decisions.
+
+--------------------------------------------------------------------
+
+Step 3 - Assembly-level validation in both tools
+Tools used:
+- Cutter: get_function_prototype(address="0x00401098")
+- Cutter: disassemble_function(address="0x00401725")
+- Ghidra: disassemble_function(address="0x00401725")
+
+Raw data read (critical instruction path):
+
+[Cutter disassembly @ 0x00401725]
+- cmp argc, 2
+- mov rax, [argv + 8]            ; argv[1]
+- lea rdx, data.00477010         ; candidate password string address
+- mov rsi, rdx
+- mov rdi, rax
+- call fcn.00401098              ; compare routine (strcmp-equivalent)
+- test/cmp result with 0
+- if zero -> puts("You achieved Level 1!")
+- else   -> puts("Sorry, not quite there yet.")
+- else-case prints "Usage: %s <password>\n" at 0x477077
+
+[Ghidra disassembly @ 0x00401725]
+- Same control flow and addresses:
+  - LEA RDX,[0x477010]
+  - CALL 0x00401098
+  - success/failure puts at 0x0040176a and 0x0040177b
+  - printf usage path via 0x0040179b
+
+[Cutter get_function_prototype @ 0x00401098]
+- Prototype unresolved as void fcn.00401098(); (not contradictory; symbol recovery limitation)
+
+Interpretation:
+- Instruction-level evidence matches decompiler output exactly.
+- The value at/near 0x00477010 is the constant compared against argv[1].
+- Branch condition is strict equality (compare result == 0).
+
+Why this was sufficient:
+- We had convergent proof from strings, decompilation, and assembly in two independent front-ends.
+
+====================================================================
+3) FINAL RESULT
+====================================================================
+Recovered password:
+flag_{Lin1_Th4tS_wHy_y0u_@Lw4y5_$t4rT_w1tH_stR!n6$!}
+
+Confidence:
+Very high.
+
+Evidence chain:
+- Password-like static string found in read-only data.
+- main compares argv[1] directly against that exact string.
+- Match controls success branch output in both Ghidra and Cutter views.
+
+====================================================================
+4) NOTES ON DATA VOLUME
+====================================================================
+The strings enumeration returned a very large output dominated by libc/glibc/runtime symbols and diagnostics. I reviewed that output and extracted only the entries relevant to the password check path listed above.
+
+====================================================================
+5) REPRODUCIBLE QUICK CHECKLIST
+====================================================================
+1. Enumerate strings, look for password/flag-like tokens and usage prompts.
+2. Decompile main entry and identify argument-count checks and compare calls.
+3. Resolve compared static address in disassembly.
+4. Confirm branch-to-success/failure messaging.
+5. Validate in both Ghidra and Cutter for consistency.
+

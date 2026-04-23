@@ -1,0 +1,249 @@
+RANSOMWARE PASSWORD RECOVERY LOG
+Date: 2026-03-31
+Analyst: Cursor Agent (GPT-5.3-codex)
+Objective: Identify the shutdown password embedded in a malware sample loaded in Ghidra.
+
+====================================================================
+SCOPE AND METHOD
+====================================================================
+I used Ghidra MCP functions to:
+1) Search string literals for potential password-related clues.
+2) Follow cross-references from suspicious strings to calling code.
+3) Decompile and disassemble the password-check path.
+4) Reverse the transformation routine used before memcmp.
+5) Reconstruct and run a local Python decryptor to recover plaintext.
+
+No patching, binary modification, or dynamic execution of the malware sample was performed.
+
+====================================================================
+CHRONOLOGICAL STEPS, RAW DATA, INTERPRETATION, AND WHY
+====================================================================
+
+Step 1 - Broad string triage for likely shutdown/password artifacts
+--------------------------------------------------------------------
+Action:
+- Queried defined strings with filters: "password", "shutdown", "kill", "stop", "ransom".
+
+Raw data returned:
+- Filter "password":
+  00478068: "Usage: %s <password>\n"
+- Filter "shutdown":
+  0047b598: "tcache_thread_shutdown(): unaligned tcache chunk detected"
+  0047c4f8: "Cannot send after transport endpoint shutdown"
+  0047f265: "ESHUTDOWN"
+- Filter "kill":
+  0047c550: "Operation not possible due to RF-kill"
+- Filters "stop" and "ransom":
+  (no useful hits returned)
+
+Interpretation:
+- "Usage: %s <password>" is strongly indicative of a command-line argument checker.
+- The "shutdown"/"kill" strings looked like libc/system noise, not malware logic.
+
+Why this mattered:
+- It isolated a likely entry point for password validation very quickly.
+
+
+Step 2 - Find where the usage string is referenced
+--------------------------------------------------
+Action:
+- Retrieved xrefs to address 0x00478068.
+
+Raw data returned:
+- From 0040274e in FUN_004026f4 [DATA]
+- From 00402758 in FUN_004026f4 [PARAM]
+
+Interpretation:
+- A single function (`FUN_004026f4`) appears to own the CLI/password control flow.
+
+Why this mattered:
+- Narrowed analysis to one function likely responsible for password handling.
+
+
+Step 3 - Confirm program entry/export context
+---------------------------------------------
+Action:
+- Queried current function and exports.
+
+Raw data returned:
+- Current function: entry at 00401660
+- Exported symbol: entry -> 00401660
+
+Interpretation:
+- Binary has a simple exported entrypoint; not a packed loader chain in this visible path.
+
+Why this mattered:
+- Confirmed we are in the right executable control path and naming state.
+
+
+Step 4 - Decompile main password dispatch function
+--------------------------------------------------
+Action:
+- Decompiled `FUN_004026f4` at 0x004026f4.
+
+Raw decompilation highlights:
+- If `param_1 == 2`:
+  - Calls `FUN_004024b8(param_2[1])`.
+  - If return == 1 prints: "You achieved Level 8!"
+  - Else prints: "Sorry, not quite there yet."
+- Else prints usage:
+  - `FUN_00405c20("Usage: %s <password>\n",*param_2);`
+
+Interpretation:
+- Program expects one command-line password argument.
+- `FUN_004024b8` is the validator.
+
+Why this mattered:
+- Established exact function that determines correct password.
+
+
+Step 5 - Decompile validator function
+-------------------------------------
+Action:
+- Decompiled `FUN_004024b8` at 0x004024b8.
+
+Raw decompilation highlights:
+- Initializes a 0x35-byte local byte array with constants:
+  c2 d4 e1 49 bd 6f b4 61 93 3f 77 26 b1 ff 4f e1
+  9f 50 03 43 8a c8 65 95 71 1f 9e a5 ab 4e a4 23
+  45 08 61 11 64 c8 ff 41 66 bb fa 40 2c 56 b8 ce
+  61 be 96 0d 35
+- Calls anti-debug/timing related routines:
+  `FUN_00402464()`, `FUN_00401c2e()`, and timing window check requiring <= 500 ms.
+- Copies 0x35 bytes from input into local buffer.
+- Calls transform:
+  `FUN_00401a89(&local_c8, 0x35, 0x9988776655443322);`
+- Compares transformed input to encrypted constant via:
+  `thunk_FUN_00419020(&local_c8, &local_88, 0x35);`
+- Returns true iff comparison is zero.
+
+Interpretation:
+- Password is not plain-text embedded; it is checked after deterministic stream-XOR transform.
+- Recoverable by inverting transform with known key stream.
+- Length is exactly 0x35 (53) bytes.
+
+Why this mattered:
+- Provided the exact cryptographic check path and ciphertext bytes.
+
+
+Step 6 - Validate comparator and identify true memcmp call-site behavior
+------------------------------------------------------------------------
+Action:
+- Decompiled 0x00419020 and queried function metadata for it.
+
+Raw data returned:
+- Decompiler output for 0x00419020 appeared as an indirect resolver-like function returning a code pointer (not directly useful for semantic compare).
+- Metadata:
+  Function: FUN_00419020 at 00419020
+  Signature: undefined FUN_00419020(void)
+  Body: 00419020 - 00419087
+
+Interpretation:
+- Decompiler view was likely confused by thunking/IFUNC resolution patterns.
+- Needed disassembly from call site to verify comparator intent.
+
+Why this mattered:
+- Prevented wrong assumptions from misleading decompiler output.
+
+
+Step 7 - Disassemble validator to recover ground-truth call semantics
+---------------------------------------------------------------------
+Action:
+- Disassembled `FUN_004024b8`.
+
+Raw disassembly highlights (critical region):
+- 004026bf: CALL 0x00401a89
+- 004026d7: MOV RDI,RAX(local transformed input), RSI=encrypted_bytes, EDX=0x35
+- 004026da: CALL 0x00401070
+- 004026df: TEST EAX,EAX
+- 004026e1: SETZ AL
+
+Interpretation:
+- Comparator is effectively `memcmp(a,b,0x35)` at 0x00401070.
+- Success when `memcmp == 0`.
+
+Why this mattered:
+- Confirmed exact equality test and length, eliminating ambiguity.
+
+
+Step 8 - Reverse transformation routine
+---------------------------------------
+Action:
+- Decompiled `FUN_00401a89` and its internal block function `FUN_00401799`.
+
+Raw data from `FUN_00401a89`:
+- Uses constant string at 0x47800e:
+  "@@expand 8-byte k"
+- Builds 64-byte state from:
+  - sigma words from "expand 8-byte k"
+  - 64-bit key derived from literal 0x9988776655443322
+  - 64-bit block counter
+- For each 64-byte block:
+  - Generates keystream via `FUN_00401799`
+  - XORs with input bytes
+
+Raw data from `FUN_00401799`:
+- 20-round Salsa-like quarter-round schedule (10 loop iterations, each with column+row rounds).
+- Adds original state words back at output (Salsa block function behavior).
+
+Additional string confirmation:
+- `list_strings(filter="expand")` returned:
+  0047800e: "@@expand 8-byte k"
+
+Interpretation:
+- This is a Salsa20-family stream cipher setup with an 8-byte key variant.
+- Because check does `transform(input) == ciphertext`, plaintext password can be recovered with:
+  `plaintext = ciphertext XOR keystream`.
+
+Why this mattered:
+- Enabled deterministic offline recovery of original password bytes.
+
+
+Step 9 - Reconstruct decryptor and handle one initial parsing error
+-------------------------------------------------------------------
+Action:
+- Ran a Python script to replicate the Salsa block and decrypt.
+
+First run raw error:
+- `struct.error: unpack requires a buffer of 4 bytes`
+
+Cause and interpretation:
+- The string constant needed 16 bytes for 4 dwords.
+- Corrected from `b"expand 8-byte k"` (15 bytes) to `b"expand 8-byte k\\x00"` (16 bytes), matching C-string layout.
+
+Why this mattered:
+- Fixed state initialization so keystream matched binary behavior.
+
+
+Step 10 - Successful decryption output
+--------------------------------------
+Action:
+- Re-ran corrected Python decryptor.
+
+Raw output:
+- `const len 16`
+- `b'flag_{Lin8_C@n_y0u_M4k3_a_b1n@ry_Pr!nt_!t$_0wn_Fl4g?}'`
+- `flag_{Lin8_C@n_y0u_M4k3_a_b1n@ry_Pr!nt_!t$_0wn_Fl4g?}`
+
+Interpretation:
+- The embedded expected plaintext password is:
+  flag_{Lin8_C@n_y0u_M4k3_a_b1n@ry_Pr!nt_!t$_0wn_Fl4g?}
+
+Why this mattered:
+- Final objective completed with a value consistent with function structure and cryptographic recovery.
+
+====================================================================
+FINAL RECOVERED PASSWORD
+====================================================================
+flag_{Lin8_C@n_y0u_M4k3_a_b1n@ry_Pr!nt_!t$_0wn_Fl4g?}
+
+====================================================================
+NOTES ON CONFIDENCE
+====================================================================
+Confidence: High.
+Reasons:
+- Password check path was directly traced from usage string to validator.
+- Validator semantics (transform + memcmp length 0x35) were confirmed in disassembly.
+- Decryption result produced coherent ASCII flag-format text.
+- Length and bytes align exactly with the check buffer size.
+
